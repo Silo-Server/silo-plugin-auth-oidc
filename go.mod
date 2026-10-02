@@ -3,7 +3,7 @@ module github.com/Silo-Server/silo-plugin-auth-oidc
 go 1.26.0
 
 require (
-	github.com/Silo-Server/silo-plugin-sdk v0.21.1-0.20261002131610-3906339366f4
+	github.com/Silo-Server/silo-plugin-sdk v0.22.0
 	github.com/go-jose/go-jose/v4 v4.1.5
 	google.golang.org/grpc v1.82.1
 	google.golang.org/protobuf v1.36.11
