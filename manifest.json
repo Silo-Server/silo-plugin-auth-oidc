@@ -1,0 +1,396 @@
+{
+  "plugin_id": "silo.auth.oidc",
+  "version": "0.1.0",
+  "checksum": "__CHECKSUM__",
+  "silo_api_version": "v1",
+  "category": "Sign-in",
+  "presentation": {
+    "display_name": "OpenID Connect Sign-in",
+    "summary": "Sign in to Silo with an OpenID Connect provider such as Authelia, authentik, Pocket ID, Keycloak, Kanidm, Zitadel or Tinyauth.",
+    "description_markdown": "Adds a \"Sign in with ...\" button that sends people to your OpenID Connect provider. The plugin validates the provider's ID token, reads the person's details and groups, and applies the allowed-groups and admin-groups rules. Silo creates or links the account and manages sessions.",
+    "setup_markdown": "1. At your provider, create a confidential client for Silo and register the redirect URI shown on Silo's Sign-in settings page.\n2. Enter the issuer URL, client ID and client secret under **Provider connection**, then run the connection test.\n3. Set the allowed and admin groups under **Access rules** if your provider sends groups.\n4. To let Silo re-check accounts at the provider, turn on **Request offline access** and make the provider's refresh-token lifetime longer than Silo's re-check interval plus about an hour. Unless the provider reports that lifetime, enter it as **Refresh token lifetime** so Silo can tell a revoked token from an expired one. Authelia never reports it. Keycloak reports it for offline tokens only when Offline Session Max Limited is on; otherwise enter the realm's Offline Session Idle (30d by default). If the provider also caps refresh tokens at a fixed age from sign-in, as Zitadel's Refresh Token Expiration does, enter that cap as **Refresh token absolute lifetime**.\n5. If you turn on **Sign out at the provider**, register Silo's sign-in page as a post-logout redirect URI at the provider.",
+    "homepage_url": "https://github.com/Silo-Server/silo-plugin-auth-oidc",
+    "source_url": "https://github.com/Silo-Server/silo-plugin-auth-oidc",
+    "support_url": "https://github.com/Silo-Server/silo-plugin-auth-oidc/issues",
+    "changelog_url": "https://github.com/Silo-Server/silo-plugin-auth-oidc/releases",
+    "publisher_name": "Silo",
+    "publisher_url": "https://github.com/Silo-Server",
+    "license_spdx": "AGPL-3.0-or-later"
+  },
+  "supported_platforms": [
+    {
+      "os": "darwin",
+      "arch": "arm64"
+    },
+    {
+      "os": "linux",
+      "arch": "amd64"
+    },
+    {
+      "os": "linux",
+      "arch": "arm64"
+    }
+  ],
+  "capabilities": [
+    {
+      "type": "auth_provider.v1",
+      "id": "oidc",
+      "display_name": "Single sign-on",
+      "description": "Sign in with an OpenID Connect provider.",
+      "auth_modes": [
+        "oauth2"
+      ],
+      "metadata": {
+        "connection_test": true
+      }
+    },
+    {
+      "type": "http_routes.v1",
+      "id": "assets",
+      "display_name": "Sign-in button assets",
+      "description": "Serves the login button icon."
+    }
+  ],
+  "http_routes": [
+    {
+      "id": "assets",
+      "method": "GET",
+      "path": "/assets/*",
+      "access": "public"
+    }
+  ],
+  "global_config_schema": [
+    {
+      "key": "display_name",
+      "title": "Button label",
+      "description": "The provider's name, such as \"authentik\" or \"Company SSO\". Silo shows it on the login button and in sentences such as \"Connect authentik\", so leave out \"Sign in with\".",
+      "json_schema": "{\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\",\"maxLength\":80}},\"additionalProperties\":false}",
+      "required": false,
+      "admin_form": {
+        "submit_label": "Save label",
+        "fields": [
+          {
+            "key": "value",
+            "label": "Button label",
+            "description": "Shown on the login page and in the apps.",
+            "control": "ADMIN_FORM_CONTROL_TEXT",
+            "placeholder": "Single sign-on",
+            "default_value": "Single sign-on",
+            "validation": {
+              "max_length": 80
+            }
+          }
+        ]
+      }
+    },
+    {
+      "key": "icon_url_path",
+      "title": "Button icon",
+      "description": "Icon on the login button, served by this plugin under /assets/. The Apple apps do not draw SVG icons, so sso.png is the one every Silo app shows.",
+      "json_schema": "{\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\",\"enum\":[\"sso.png\",\"sso.svg\"],\"default\":\"sso.png\"}},\"additionalProperties\":false}",
+      "required": false,
+      "admin_form": {
+        "submit_label": "Save icon",
+        "fields": [
+          {
+            "key": "value",
+            "label": "Icon file",
+            "description": "The login button uses sso.png until this setting is saved.",
+            "control": "ADMIN_FORM_CONTROL_SELECT",
+            "default_value": "sso.png",
+            "options": [
+              {
+                "value": "sso.png",
+                "label": "Key icon, PNG (all apps)"
+              },
+              {
+                "value": "sso.svg",
+                "label": "Key icon, SVG (not shown in the Apple apps)"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "key": "connection",
+      "title": "Provider connection",
+      "description": "Where the OpenID Connect provider is and how Silo authenticates to it. The redirect URI to register at the provider is shown on the Sign-in settings page.",
+      "json_schema": "{\"type\":\"object\",\"properties\":{\"issuer_url\":{\"type\":\"string\"},\"client_id\":{\"type\":\"string\"},\"client_secret\":{\"type\":\"string\",\"writeOnly\":true},\"token_endpoint_auth_method\":{\"type\":\"string\",\"enum\":[\"client_secret_basic\",\"client_secret_post\"]},\"scopes\":{\"type\":\"string\"},\"request_groups_scope\":{\"type\":\"boolean\"},\"request_offline_access\":{\"type\":\"boolean\"},\"refresh_token_lifetime\":{\"type\":\"string\",\"maxLength\":16,\"pattern\":\"^\\\\s*(0|([0-9]{1,4})d|(?:([0-9]{1,6})h)?(?:([0-9]{1,7})m)?)\\\\s*$\"},\"refresh_token_max_lifetime\":{\"type\":\"string\",\"maxLength\":16,\"pattern\":\"^\\\\s*(0|([0-9]{1,4})d|(?:([0-9]{1,6})h)?(?:([0-9]{1,7})m)?)\\\\s*$\"},\"prompt\":{\"type\":\"string\",\"enum\":[\"\",\"login\",\"select_account\",\"consent\"]},\"provider_logout\":{\"type\":\"boolean\"},\"ca_pem\":{\"type\":\"string\"},\"allow_hs256\":{\"type\":\"boolean\"}},\"additionalProperties\":false}",
+      "required": true,
+      "admin_form": {
+        "submit_label": "Save connection",
+        "fields": [
+          {
+            "key": "issuer_url",
+            "label": "Issuer URL",
+            "description": "The provider's issuer, exactly as its discovery document reports it, including any trailing slash (authentik has one). Must use https.",
+            "control": "ADMIN_FORM_CONTROL_TEXT",
+            "placeholder": "https://auth.example.com/application/o/silo/",
+            "required": true
+          },
+          {
+            "key": "client_id",
+            "label": "Client ID",
+            "control": "ADMIN_FORM_CONTROL_TEXT",
+            "required": true,
+            "description": "The ID of the client you created for Silo at the provider."
+          },
+          {
+            "key": "client_secret",
+            "label": "Client secret",
+            "control": "ADMIN_FORM_CONTROL_PASSWORD",
+            "secret": true,
+            "description": "Stored encrypted. Register Silo as a confidential client."
+          },
+          {
+            "key": "token_endpoint_auth_method",
+            "label": "Client authentication",
+            "control": "ADMIN_FORM_CONTROL_SELECT",
+            "default_value": "client_secret_basic",
+            "description": "How Silo sends the client secret to the token endpoint.",
+            "options": [
+              {
+                "value": "client_secret_basic",
+                "label": "HTTP Basic (client_secret_basic)"
+              },
+              {
+                "value": "client_secret_post",
+                "label": "Form body (client_secret_post)"
+              }
+            ]
+          },
+          {
+            "key": "scopes",
+            "label": "Scopes",
+            "control": "ADMIN_FORM_CONTROL_TEXT",
+            "default_value": "openid profile email",
+            "placeholder": "openid profile email",
+            "description": "Space-separated. openid is always sent. Zitadel roles need urn:zitadel:iam:org:projects:roles."
+          },
+          {
+            "key": "request_groups_scope",
+            "label": "Request the groups scope",
+            "control": "ADMIN_FORM_CONTROL_SWITCH",
+            "default_value": false,
+            "description": "Adds the groups scope. Authelia, Pocket ID, Kanidm and Tinyauth need it for group rules; authentik and Keycloak send groups without it."
+          },
+          {
+            "key": "request_offline_access",
+            "label": "Request offline access",
+            "control": "ADMIN_FORM_CONTROL_SWITCH",
+            "default_value": false,
+            "description": "Adds offline_access. Silo re-checks accounts at the provider only when the provider grants it; otherwise sessions get an absolute age limit. The provider's refresh-token lifetime must be longer than Silo's re-check interval plus about an hour (Authelia's default of 90 minutes is too short). Leave it off for Kanidm, which refuses scopes missing from its scope map."
+          },
+          {
+            "key": "refresh_token_lifetime",
+            "label": "Refresh token lifetime",
+            "control": "ADMIN_FORM_CONTROL_TEXT",
+            "placeholder": "30d",
+            "description": "How long one of the provider's refresh tokens lasts, counted from when it was issued or last renewed, such as 90m, 12h or 30d. If several limits apply, enter the shortest. Needed unless the provider reports it: Authelia never does, and Keycloak does only when Offline Session Max Limited is on; otherwise enter the realm's Offline Session Idle (30d by default). Providers refuse expired and revoked tokens with the same error. Within this lifetime, Silo treats a refusal as a revocation and signs the person out, so a value longer than the real one signs people out when their tokens merely expire. If you do not know it, leave it blank: refusals then sign no one out, and sessions keep an absolute age limit.",
+            "validation": {
+              "max_length": 16,
+              "pattern": "^\\s*(0|([0-9]{1,4})d|(?:([0-9]{1,6})h)?(?:([0-9]{1,7})m)?)\\s*$"
+            }
+          },
+          {
+            "key": "refresh_token_max_lifetime",
+            "label": "Refresh token absolute lifetime",
+            "control": "ADMIN_FORM_CONTROL_TEXT",
+            "placeholder": "90d",
+            "description": "The provider's fixed cap on refresh tokens, counted from sign-in however often they are renewed, such as Zitadel's Refresh Token Expiration (90d by default). Silo treats a refusal at or after this age as expiry, not a revocation. Without it, such a cap signs active people out of Silo when it ends, whenever Refresh token lifetime is set. Leave it blank if the provider has no such cap.",
+            "validation": {
+              "max_length": 16,
+              "pattern": "^\\s*(0|([0-9]{1,4})d|(?:([0-9]{1,6})h)?(?:([0-9]{1,7})m)?)\\s*$"
+            }
+          },
+          {
+            "key": "prompt",
+            "label": "Prompt",
+            "control": "ADMIN_FORM_CONTROL_SELECT",
+            "default_value": "",
+            "description": "Asks the provider to show its login or account picker every time.",
+            "options": [
+              {
+                "value": "",
+                "label": "Provider default"
+              },
+              {
+                "value": "login",
+                "label": "Always ask for credentials (login)"
+              },
+              {
+                "value": "select_account",
+                "label": "Account picker (select_account)"
+              },
+              {
+                "value": "consent",
+                "label": "Always ask for consent (consent)"
+              }
+            ]
+          },
+          {
+            "key": "provider_logout",
+            "label": "Sign out at the provider",
+            "control": "ADMIN_FORM_CONTROL_SWITCH",
+            "default_value": false,
+            "description": "On web sign-out, also end the provider session when it has an end-session endpoint. Register Silo's sign-in page as a post-logout redirect URI at the provider (Keycloak: Valid post logout redirect URIs; Zitadel: Post Logout URIs). Authelia, Kanidm and Tinyauth have no end-session endpoint."
+          },
+          {
+            "key": "ca_pem",
+            "label": "Custom CA certificate (PEM)",
+            "control": "ADMIN_FORM_CONTROL_TEXTAREA",
+            "multiline": true,
+            "rows": 6,
+            "placeholder": "-----BEGIN CERTIFICATE-----",
+            "description": "Trust this CA in addition to the system roots, for a provider with a private certificate. There is no option to skip verification."
+          },
+          {
+            "key": "allow_hs256",
+            "label": "Allow HS256 ID tokens",
+            "control": "ADMIN_FORM_CONTROL_SWITCH",
+            "default_value": false,
+            "description": "Accept ID tokens signed with the client secret. Only for providers without a signing key, such as an authentik provider with no signing key set. Prefer configuring a signing key."
+          }
+        ],
+        "sections": [
+          {
+            "key": "client",
+            "title": "Client",
+            "field_keys": [
+              "issuer_url",
+              "client_id",
+              "client_secret",
+              "token_endpoint_auth_method"
+            ]
+          },
+          {
+            "key": "request",
+            "title": "Sign-in request",
+            "field_keys": [
+              "scopes",
+              "request_groups_scope",
+              "request_offline_access",
+              "refresh_token_lifetime",
+              "refresh_token_max_lifetime",
+              "prompt",
+              "provider_logout"
+            ]
+          },
+          {
+            "key": "advanced",
+            "title": "Advanced",
+            "collapsible": true,
+            "collapsed_default": true,
+            "field_keys": [
+              "ca_pem",
+              "allow_hs256"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "key": "claims",
+      "title": "Claim mapping",
+      "description": "Which ID token or userinfo claims hold each detail. Silo merges the userinfo claims over the ID token claims.",
+      "json_schema": "{\"type\":\"object\",\"properties\":{\"username\":{\"type\":\"string\"},\"email\":{\"type\":\"string\"},\"display_name\":{\"type\":\"string\"},\"groups\":{\"type\":\"string\"},\"picture\":{\"type\":\"string\"},\"subject\":{\"type\":\"string\",\"enum\":[\"auto\",\"standard\",\"entra\"]}},\"additionalProperties\":false}",
+      "required": false,
+      "admin_form": {
+        "submit_label": "Save claim mapping",
+        "fields": [
+          {
+            "key": "username",
+            "label": "Username claim",
+            "control": "ADMIN_FORM_CONTROL_TEXT",
+            "default_value": "preferred_username",
+            "placeholder": "preferred_username",
+            "description": "Base for a new Silo username."
+          },
+          {
+            "key": "email",
+            "label": "Email claim",
+            "control": "ADMIN_FORM_CONTROL_TEXT",
+            "default_value": "email",
+            "placeholder": "email"
+          },
+          {
+            "key": "display_name",
+            "label": "Display name claim",
+            "control": "ADMIN_FORM_CONTROL_TEXT",
+            "default_value": "name",
+            "placeholder": "name",
+            "description": "Falls back to given_name and family_name."
+          },
+          {
+            "key": "groups",
+            "label": "Groups claim",
+            "control": "ADMIN_FORM_CONTROL_TEXT",
+            "default_value": "groups",
+            "placeholder": "groups",
+            "description": "A list of names, or an object whose keys are the groups. Zitadel: urn:zitadel:iam:org:project:roles. Dots walk into nested claims, as in realm_access.roles."
+          },
+          {
+            "key": "picture",
+            "label": "Picture claim",
+            "control": "ADMIN_FORM_CONTROL_TEXT",
+            "default_value": "picture",
+            "placeholder": "picture"
+          },
+          {
+            "key": "subject",
+            "label": "Account key",
+            "control": "ADMIN_FORM_CONTROL_SELECT",
+            "default_value": "auto",
+            "description": "What links a provider account to a Silo account. Changing it after people have signed in disconnects their accounts.",
+            "options": [
+              {
+                "value": "auto",
+                "label": "Automatic",
+                "description": "Tenant and object ID for Microsoft Entra ID, issuer and subject otherwise."
+              },
+              {
+                "value": "standard",
+                "label": "Issuer and subject (iss + sub)"
+              },
+              {
+                "value": "entra",
+                "label": "Entra tenant and object ID (tid + oid)"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "key": "access",
+      "title": "Access rules",
+      "description": "Group rules the plugin applies to the provider's groups at every sign-in and account re-check.",
+      "json_schema": "{\"type\":\"object\",\"properties\":{\"allowed_groups\":{\"type\":\"string\"},\"admin_groups\":{\"type\":\"string\"}},\"additionalProperties\":false}",
+      "required": false,
+      "admin_form": {
+        "submit_label": "Save access rules",
+        "fields": [
+          {
+            "key": "allowed_groups",
+            "label": "Allowed groups",
+            "control": "ADMIN_FORM_CONTROL_TEXTAREA",
+            "multiline": true,
+            "rows": 3,
+            "placeholder": "silo-users",
+            "description": "One per line. People in none of these groups are refused. Leave empty to allow everyone the provider signs in. Keycloak paths match with or without the leading /, and a Kanidm name matches its name@domain form."
+          },
+          {
+            "key": "admin_groups",
+            "label": "Admin groups",
+            "control": "ADMIN_FORM_CONTROL_TEXTAREA",
+            "multiline": true,
+            "rows": 3,
+            "placeholder": "silo-admins",
+            "description": "One per line. Members become Silo admins and everyone else becomes a regular user, at every sign-in and re-check. Leave empty to manage roles in Silo."
+          }
+        ]
+      }
+    }
+  ]
+}
