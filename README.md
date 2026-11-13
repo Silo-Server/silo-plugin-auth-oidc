@@ -164,6 +164,11 @@ auth additions and is not tagged yet, and replaces it with a local SDK
 checkout. CI rejects that replace, so remove it once `v0.22.0` is published. For other multi-repository work, use a local
 `go.work` instead of a `replace`.
 
+## Releases
+
+Releases are signed with GitHub artifact attestations. [CONTRIBUTING.md](CONTRIBUTING.md#release)
+describes how maintainers cut a release and how to verify a downloaded binary.
+
 ## Contributing
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
