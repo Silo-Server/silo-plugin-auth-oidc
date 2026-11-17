@@ -149,7 +149,7 @@ make test       # go test ./...
 make vet
 make lint       # golangci-lint
 make build      # ./plugin
-make build-all  # dist/plugin-<os>-<arch> for darwin/arm64, linux/amd64, linux/arm64
+make build-all  # dist/plugin-<os>-<arch> for darwin/arm64, freebsd/amd64, freebsd/arm64, linux/amd64, linux/arm64
 ```
 
 `internal/oidctest` runs an in-process OpenID provider over TLS for the tests.

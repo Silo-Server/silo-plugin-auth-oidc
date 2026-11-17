@@ -1,6 +1,6 @@
 {
   "plugin_id": "silo.auth.oidc",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "checksum": "__CHECKSUM__",
   "silo_api_version": "v1",
   "category": "Sign-in",
@@ -20,6 +20,14 @@
   "supported_platforms": [
     {
       "os": "darwin",
+      "arch": "arm64"
+    },
+    {
+      "os": "freebsd",
+      "arch": "amd64"
+    },
+    {
+      "os": "freebsd",
       "arch": "arm64"
     },
     {
