@@ -28,6 +28,26 @@ const (
 	SubjectEntra    = "entra"
 )
 
+// Pushed authorization request modes, the values of
+// connection.pushed_authorization. Blank reads as PARWhenSupported. They are
+// stored per installation, so they must never change.
+const (
+	PARWhenSupported = "when_supported"
+	PARAlways        = "always"
+	PARNever         = "never"
+)
+
+// PARModes lists the pushed authorization request modes in the order
+// manifest.json offers them.
+var PARModes = []string{PARWhenSupported, PARAlways, PARNever}
+
+// Admin form labels of connection.pushed_authorization and
+// connection.token_endpoint_auth_method, as messages name them.
+const (
+	labelPAR        = "Pushed authorization requests"
+	labelClientAuth = "Client authentication"
+)
+
 // Default claim names.
 const (
 	defaultScopes           = "openid profile email"
@@ -43,10 +63,12 @@ var promptValues = []string{"none", "login", "consent", "select_account", "creat
 
 // Config is the plugin's parsed global configuration.
 type Config struct {
-	Issuer               string
-	ClientID             string
-	ClientSecret         string
-	TokenAuthMethod      string
+	Issuer          string
+	ClientID        string
+	ClientSecret    string
+	TokenAuthMethod string
+	// PushedAuthorization is one of PARModes. Blank reads as PARWhenSupported.
+	PushedAuthorization  string
 	Scopes               []string
 	RequestGroupsScope   bool
 	RequestOfflineAccess bool
@@ -114,6 +136,7 @@ func ParseConfig(entries []*pluginv1.ConfigEntry) (Config, error) {
 	read(keyConnection, "client_id", &cfg.ClientID)
 	read(keyConnection, "client_secret", &cfg.ClientSecret)
 	read(keyConnection, "token_endpoint_auth_method", &cfg.TokenAuthMethod)
+	read(keyConnection, "pushed_authorization", &cfg.PushedAuthorization)
 	var scopes string
 	read(keyConnection, "scopes", &scopes)
 	readBool(keyConnection, "request_groups_scope", &cfg.RequestGroupsScope)
@@ -148,6 +171,7 @@ func ParseConfig(entries []*pluginv1.ConfigEntry) (Config, error) {
 	if cfg.TokenAuthMethod == "" {
 		cfg.TokenAuthMethod = oidc.AuthMethodBasic
 	}
+	cfg.PushedAuthorization = orDefault(cfg.PushedAuthorization, PARWhenSupported)
 	if strings.TrimSpace(scopes) == "" {
 		scopes = defaultScopes
 	}
@@ -230,6 +254,9 @@ func (c Config) Problems() []string {
 	case oidc.AuthMethodBasic, oidc.AuthMethodPost:
 	default:
 		problems = append(problems, fmt.Sprintf("Token endpoint authentication %q is not supported.", c.TokenAuthMethod))
+	}
+	if c.PushedAuthorization != "" && !slices.Contains(PARModes, c.PushedAuthorization) {
+		problems = append(problems, fmt.Sprintf("%s %q is not supported.", labelPAR, c.PushedAuthorization))
 	}
 	if c.Prompt != "" {
 		if err := validatePrompt(c.Prompt); err != nil {

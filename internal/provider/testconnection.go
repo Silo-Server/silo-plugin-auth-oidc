@@ -2,7 +2,9 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"slices"
 	"strings"
 
@@ -21,12 +23,15 @@ const (
 	stepClientAuth = "client_auth"
 	stepClient     = "client_credentials"
 	stepPKCE       = "pkce"
+	stepPAR        = "par"
 	stepScopes     = "scopes"
 	stepLogout     = "provider_logout"
 )
 
-// probeRedirectURI is sent with the fallback authorization-code probe. The
-// code is invalid anyway; the redirect only has to be a well-formed https URL.
+// probeRedirectURI is sent with the fallback authorization-code probe and the
+// test push. The code is invalid anyway, and a provider that accepts the push
+// stores one unused request that expires on its own; the redirect only has to
+// be a well-formed https URL.
 const probeRedirectURI = "https://silo.invalid/api/v2/auth/oauth/0/callback"
 
 // TestConnection checks the staged configuration in the request with a fresh
@@ -151,6 +156,10 @@ func (p *Provider) TestConnection(ctx context.Context, req *pluginv1.AuthTestCon
 		run.pass(stepPKCE, "PKCE S256", "The provider supports S256.")
 	}
 
+	if !run.pushedAuthorization(ctx, cfg, client, doc) {
+		return run.response(), nil
+	}
+
 	requested := cfg.RequestedScopes()
 	scopeMessage := "Requesting " + strings.Join(requested, " ") + "."
 	if len(doc.ScopesSupported) > 0 {
@@ -193,6 +202,80 @@ func (p *Provider) TestConnection(ctx context.Context, req *pluginv1.AuthTestCon
 		}
 	}
 	return run.response(), nil
+}
+
+// pushedAuthorization runs the par step and reports whether the test goes on.
+// When the staged settings would use PAR it pushes a test request through the
+// same code sign-in uses.
+func (r *testRun) pushedAuthorization(ctx context.Context, cfg Config, client *oidc.Client, doc *oidc.Discovery) bool {
+	advertised := doc.PushedAuthorizationRequestEndpoint != ""
+	if cfg.PushedAuthorization == PARNever {
+		switch {
+		case bool(doc.RequirePushedAuthorizationRequests):
+			r.fail(stepPAR, labelPAR, "The provider requires pushed authorization requests, but the setting is Never, so the provider refuses every sign-in."+
+				" Choose When the provider supports it or Always.")
+			return false
+		case advertised:
+			r.pass(stepPAR, labelPAR, "Turned off. The provider offers them; Silo sends the sign-in request in the browser URL.")
+		default:
+			r.pass(stepPAR, labelPAR, "Turned off. The provider does not offer them either.")
+		}
+		return true
+	}
+	use, err := usePAR(cfg, doc)
+	if err != nil {
+		r.fail(stepPAR, labelPAR, "The setting is Always, but the provider does not offer pushed authorization requests"+
+			" (its discovery document has no pushed_authorization_request_endpoint), so every sign-in fails."+
+			" Choose When the provider supports it or Never.")
+		return false
+	}
+	if !use {
+		r.pass(stepPAR, labelPAR, "The provider does not offer them, so Silo sends the sign-in request in the browser URL.")
+		return true
+	}
+
+	verifier, verifierErr := oidc.RandomToken(32)
+	nonce, nonceErr := oidc.RandomToken(32)
+	if err := errors.Join(verifierErr, nonceErr); err != nil {
+		r.fail(stepPAR, labelPAR, "Could not generate a test request: "+err.Error())
+		return false
+	}
+	_, err = client.PushAuthorization(ctx, doc, oidc.AuthRequest{
+		RedirectURI:   probeRedirectURI,
+		State:         "silo-connection-test",
+		Nonce:         nonce,
+		CodeChallenge: oidc.S256Challenge(verifier),
+		Scopes:        cfg.RequestedScopes(),
+		Prompt:        cfg.Prompt,
+	})
+	var oauthErr *oidc.OAuthError
+	var answerErr *oidc.AnswerError
+	switch {
+	case err == nil:
+		r.pass(stepPAR, labelPAR, "The provider accepted a test request, so Silo sends sign-in requests over the back channel.")
+		return true
+	case errors.As(err, &oauthErr) && (oauthErr.Code == "invalid_client" || oauthErr.Code == "unauthorized_client" || oauthErr.Status == http.StatusUnauthorized),
+		errors.As(err, &answerErr) && answerErr.Status == http.StatusUnauthorized:
+		r.fail(stepPAR, labelPAR, fmt.Sprintf("The provider refused the client at its pushed authorization request endpoint (%v)."+
+			" Check the client secret and Client authentication (Pocket ID may need Form body), or choose Never to sign in without them.", err))
+		return false
+	case errors.As(err, &oauthErr) && oauthErr.Status == http.StatusBadRequest && oauthErr.Code == "unknown_error":
+		// Pocket ID v2.9.0 answers a refused client and a refused redirect
+		// URI alike, with free text as the error code.
+		r.pass(stepPAR, labelPAR, "Not confirmed: the provider answered 400 with an error Silo does not recognize,"+
+			" so the test could not tell a refused client from a refused test redirect URI. Sign in once to confirm."+
+			" If sign-in fails, try the other Client authentication method (Pocket ID v2.9.0 needs Form body)"+
+			" or set Pushed authorization requests to Never.")
+		return true
+	case errors.As(err, &oauthErr) && oauthErr.Status == http.StatusBadRequest:
+		r.pass(stepPAR, labelPAR, fmt.Sprintf("Not confirmed: the endpoint answered %d %s to a test request and did not refuse the client."+
+			" The test cannot send Silo's real redirect URI, so sign in once to confirm.", oauthErr.Status, oauthErr.Code))
+		return true
+	default:
+		r.fail(stepPAR, labelPAR, fmt.Sprintf("The test request failed (%v), so every sign-in would fail."+
+			" Choose Never to sign in without pushed authorization requests.", err))
+		return false
+	}
 }
 
 type testRun struct {

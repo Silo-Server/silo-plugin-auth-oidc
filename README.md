@@ -17,6 +17,22 @@ role, and manages sessions. The plugin holds no Silo account logic.
   (authentik's issuer has one).
 - Sends PKCE S256 and a nonce on every sign-in, whatever the provider
   advertises.
+- Uses pushed authorization requests (PAR, RFC 9126) when the provider's
+  discovery document has a `pushed_authorization_request_endpoint`, unless
+  **Pushed authorization requests** is set to Never. The plugin posts the
+  sign-in request to that endpoint, authenticated as Silo the same way as at
+  the token endpoint, and sends the browser to the provider with only
+  `client_id` and the returned `request_uri`, so the browser can neither read
+  nor change the request. A failed push fails the sign-in start: the plugin
+  never retries it in the browser URL, and the push never follows a redirect.
+  The provider's `request_uri` lives briefly (60 seconds in Keycloak), so
+  reloading the provider's login page after it expires shows the provider's
+  error page, and the person starts again from Silo. Some providers also
+  consume the `request_uri` on the first request (Pocket ID v2.19.3 does), so
+  there reloading the provider's login page fails even before it expires.
+  Discovery is cached for an hour, so a provider that starts or stops
+  offering PAR is picked up within the hour, or at once when the settings are
+  saved.
 - Validates the ID token: signature, `iss`, `aud` and `azp`, `exp`, `iat`,
   `nbf`, and `nonce`. It accepts RS256/384/512, PS256/384/512,
   ES256/384/512, and EdDSA. HS256 (signed with the client secret) is refused
@@ -107,6 +123,7 @@ certificate authority, paste the CA certificate into **Custom CA certificate**.
 | Provider connection | `issuer_url` | | Exact issuer, https only. |
 | | `client_id`, `client_secret` | | The secret is stored encrypted by Silo. |
 | | `token_endpoint_auth_method` | `client_secret_basic` | Or `client_secret_post`. |
+| | `pushed_authorization` | `when_supported` | `when_supported` uses PAR when the provider offers it. `always` fails sign-in when the provider does not; use it when the provider requires PAR for Silo's client. `never` sends the request in the browser URL. Blank means `when_supported`. |
 | | `scopes` | `openid profile email` | `openid` is always sent. |
 | | `request_groups_scope` | off | Adds `groups`. |
 | | `request_offline_access` | off | Adds `offline_access`. Re-checks need it granted. |
@@ -127,12 +144,12 @@ Silo accounts from the provider.
 
 | Provider | Issuer | Groups |
 |---|---|---|
-| Authelia | `https://auth.example` | Turn on the groups scope. Groups and email arrive only through userinfo. No logout endpoint. Refresh tokens need offline access and consent. The default refresh-token lifespan is 90 minutes, so most re-checks would find the token expired: add a custom lifespan under `identity_providers.oidc.lifespans.custom` with a longer `refresh_token`, set it as the client's `lifespan`, and enter the same value as **Refresh token lifetime**. Authelia does not report the lifetime. |
+| Authelia | `https://auth.example` | Offers PAR; with `require_pushed_authorization_requests` on the client, set **Pushed authorization requests** to Always. Turn on the groups scope. Groups and email arrive only through userinfo. No logout endpoint. Refresh tokens need offline access and consent. The default refresh-token lifespan is 90 minutes, so most re-checks would find the token expired: add a custom lifespan under `identity_providers.oidc.lifespans.custom` with a longer `refresh_token`, set it as the client's `lifespan`, and enter the same value as **Refresh token lifetime**. Authelia does not report the lifetime. |
 | authentik | `https://auth.example/application/o/<slug>/` (trailing slash) | Sent with the `profile` scope. `email_verified` is always false. Set a signing key on the provider, or allow HS256. |
-| Pocket ID | `https://id.example` | Turn on the groups scope. |
-| Keycloak | `https://kc.example/realms/<realm>` | Add a group membership mapper. Full paths such as `/silo-users` match `silo-users`. Keep `offline_access` among the client's optional scopes. Offline tokens report their lifetime only when the realm's **Offline Session Max Limited** is on; otherwise enter the realm's **Offline Session Idle** (`30d` by default) as **Refresh token lifetime**. Without it, Silo cannot tell a revoked token from an expired one, so a person removed at Keycloak keeps their Silo sessions and API keys until Silo's absolute age limit. With offline access on, Keycloak 26 does not reuse its browser session for the next sign-in and asks for the password again. For provider sign-out, add Silo's sign-in page to **Valid post logout redirect URIs**. |
+| Pocket ID | `https://id.example` | Turn on the groups scope. Pocket ID offers PAR. v2.9.0 refuses the push when **Client authentication** is HTTP Basic (`client_secret_basic`), because its PAR endpoint ignores Basic credentials when the form carries `client_id`, which every push does. It answers with an error the connection test cannot tell apart from a refused test redirect URI, so the test passes as not confirmed. v2.19.3 accepts the push. To fix a refused sign-in, upgrade Pocket ID, or choose Form body (`client_secret_post`), or set **Pushed authorization requests** to Never. |
+| Keycloak | `https://kc.example/realms/<realm>` | Offers PAR; when the client's **Pushed Authorization Request Required** is on, set **Pushed authorization requests** to Always. Add a group membership mapper. Full paths such as `/silo-users` match `silo-users`. Keep `offline_access` among the client's optional scopes. Offline tokens report their lifetime only when the realm's **Offline Session Max Limited** is on; otherwise enter the realm's **Offline Session Idle** (`30d` by default) as **Refresh token lifetime**. Without it, Silo cannot tell a revoked token from an expired one, so a person removed at Keycloak keeps their Silo sessions and API keys until Silo's absolute age limit. With offline access on, Keycloak 26 does not reuse its browser session for the next sign-in and asks for the password again. For provider sign-out, add Silo's sign-in page to **Valid post logout redirect URIs**. |
 | Kanidm | `https://idm.example/oauth2/openid/<client>` | Turn on the groups scope and add it to the scope map. Groups arrive as `name@domain` and UUIDs; `silo-users` matches `silo-users@domain`. Leave offline access off: Kanidm refuses scopes missing from the scope map, and the refresh tokens it issues without `offline_access` are not kept, so sessions get Silo's absolute age limit. `preferred_username` is the SPN `name@domain`; Silo uses the part before the `@` (such as `bob`) as a new account's username. |
-| Zitadel | `https://zitadel.example` | Add scope `urn:zitadel:iam:org:projects:roles` and set the groups claim to `urn:zitadel:iam:org:project:roles`; role keys are the groups. Zitadel reports no refresh-token lifetime: enter its **Refresh Token Idle Expiration** (30 days by default) as **Refresh token lifetime** and its **Refresh Token Expiration** (90 days by default) as **Refresh token absolute lifetime**. The latter counts from sign-in however often the token rotates; without it, people are signed out of Silo when it ends. For provider sign-out, add Silo's sign-in page to the application's **Post Logout URIs**. |
+| Zitadel | `https://zitadel.example` | Does not offer PAR, so sign-in uses the browser URL. Add scope `urn:zitadel:iam:org:projects:roles` and set the groups claim to `urn:zitadel:iam:org:project:roles`; role keys are the groups. Zitadel reports no refresh-token lifetime: enter its **Refresh Token Idle Expiration** (30 days by default) as **Refresh token lifetime** and its **Refresh Token Expiration** (90 days by default) as **Refresh token absolute lifetime**. The latter counts from sign-in however often the token rotates; without it, people are signed out of Silo when it ends. For provider sign-out, add Silo's sign-in page to the application's **Post Logout URIs**. |
 | Tinyauth | `https://tinyauth.example` | Turn on the groups scope; groups come from its LDAP backend. No logout endpoint. `sub` is derived from the username, so renaming a user in the directory disconnects their Silo account. |
 | Microsoft Entra ID | `https://login.microsoftonline.com/<tenant id>/v2.0` | Group object IDs. Single-tenant issuers only. |
 
@@ -154,7 +171,8 @@ make build-all  # dist/plugin-<os>-<arch> for darwin/arm64, freebsd/amd64, freeb
 
 `internal/oidctest` runs an in-process OpenID provider over TLS for the tests.
 It covers the quirks listed above: userinfo-only claims, group claim shapes,
-key rotation, HS256, refresh token rotation, and missing endpoints.
+key rotation, HS256, refresh token rotation, missing endpoints, and a PAR
+endpoint with single-use, expiring request URIs.
 
 To try a build against a Silo server, upload the binary on the server's plugin
 page; Silo reads the manifest with `./plugin manifest`.

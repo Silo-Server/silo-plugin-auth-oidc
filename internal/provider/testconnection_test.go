@@ -48,7 +48,7 @@ func TestTestConnectionHappyPath(t *testing.T) {
 	if !resp.GetOk() {
 		t.Fatalf("connection test failed: %+v", resp.GetSteps())
 	}
-	want := []string{stepSettings, stepDiscovery, stepIssuer, stepEndpoints, stepJWKS, stepClientAuth, stepClient, stepPKCE, stepScopes, stepLogout}
+	want := []string{stepSettings, stepDiscovery, stepIssuer, stepEndpoints, stepJWKS, stepClientAuth, stepClient, stepPKCE, stepPAR, stepScopes, stepLogout}
 	if got := stepIDs(resp); strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("steps = %v, want %v", got, want)
 	}

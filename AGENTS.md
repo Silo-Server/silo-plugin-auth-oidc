@@ -8,6 +8,8 @@ This plugin decides who may sign in to Silo. Keep these invariants, and add a te
 
 - The account key is the exact issuer plus `sub` (Entra: `tid` plus `oid`). Never normalize the issuer and never key on username or email.
 - Every authorization sends PKCE S256 and a fresh nonce. ID tokens are checked for signature, `iss`, `aud`/`azp`, `exp`, `iat`, and `nonce`. HS256 stays behind its opt-in.
+- With pushed authorization requests (PAR), the pushed request carries the same PKCE S256 challenge, nonce, and state, and the browser URL carries only `client_id` and `request_uri`.
+- A failed push fails the sign-in start. The plugin never retries it as a browser-URL request, and the push never follows a redirect.
 - Userinfo never overrides `iss`, `sub`, `tid`, `oid`, or other token claims, and its `sub` must match the ID token.
 - No option skips TLS verification. The plugin dials only the configured issuer's endpoints and never fetches a user-supplied URL such as `picture`.
 - A denial leaves `external_subject` empty. Messages, denial details, and logs never contain secrets or tokens.

@@ -1,7 +1,7 @@
 // Package oidctest runs an in-process OpenID Connect provider for tests. It
-// serves discovery, JWKS, authorize, token, userinfo, and end-session over TLS
-// with keys generated at start, and exposes knobs for the quirks of real
-// providers.
+// serves discovery, JWKS, authorize, pushed authorization requests (PAR),
+// token, userinfo, and end-session over TLS with keys generated at start, and
+// exposes knobs for the quirks of real providers.
 package oidctest
 
 import (
@@ -37,7 +37,7 @@ type User struct {
 	UserinfoClaims map[string]any
 }
 
-// Request records one call to the authorize or token endpoint.
+// Request records one call to the authorize, PAR, or token endpoint.
 type Request struct {
 	Query         url.Values
 	Form          url.Values
@@ -53,6 +53,24 @@ type grant struct {
 	scope         string
 	refreshSerial int
 }
+
+// pushedRequest is an authorization request stored by the PAR endpoint.
+type pushedRequest struct {
+	clientID string
+	params   url.Values
+	expires  time.Time
+}
+
+// RequestURIPrefix starts every request_uri the PAR endpoint issues.
+const RequestURIPrefix = "urn:ietf:params:oauth:request_uri:"
+
+// PocketIDMissingCredentials is the free-text error Pocket ID v2.9.0 sends at
+// its PAR endpoint when the form lacks client_id or client_secret.
+const PocketIDMissingCredentials = "Client id or secret not provided"
+
+// defaultPARLifetime is how long a pushed request lives unless PARLifetime
+// says otherwise, as in Keycloak.
+const defaultPARLifetime = 60 * time.Second
 
 type signingKey struct {
 	alg     jose.SignatureAlgorithm
@@ -143,6 +161,39 @@ type IdP struct {
 	BadClientStatus int
 	BadClientError  string
 
+	// PAR advertises pushed_authorization_request_endpoint. Off by default,
+	// so tests exercise the browser-URL path unless they turn it on.
+	PAR bool
+	// RequirePAR advertises require_pushed_authorization_requests (and the
+	// endpoint) and refuses authorization requests that do not carry a
+	// request_uri.
+	RequirePAR bool
+	// PARStatus, PARError and PARBody replace the PAR endpoint's answer once
+	// the request is recorded. PARBody is written as is with PARStatus (400
+	// when unset), for non-JSON answers and providers that echo request
+	// values. PARError answers a JSON OAuth error with PARStatus (400 when
+	// unset). PARStatus alone answers that status with an empty body.
+	PARStatus int
+	PARError  string
+	PARBody   string
+	// PARDelay holds each PAR answer back, or until the client gives up.
+	// The push is recorded either way.
+	PARDelay time.Duration
+	// PARRedirect answers every push with a 307 to a second endpoint, which
+	// records what reaches it in RedirectedPushes.
+	PARRedirect bool
+	// PARLifetime is how long a request_uri stays valid (default 60s).
+	PARLifetime time.Duration
+	// OmitRequestURI answers a successful push with 201 but no request_uri.
+	OmitRequestURI bool
+	// PARIgnoreBasicWithClientID reads HTTP Basic credentials at the PAR
+	// endpoint only when the form has neither client_id nor client_secret, as
+	// Pocket ID v2.9.0 does. When the form has one without the other, which is
+	// every push under client_secret_basic, it answers 400 with a free-text
+	// sentence as the error code and no description, and never checks the
+	// secret, as v2.9.0 does.
+	PARIgnoreBasicWithClientID bool
+
 	keys      []*signingKey
 	current   *signingKey
 	foreign   *signingKey
@@ -150,13 +201,16 @@ type IdP struct {
 	codes     map[string]*grant
 	refreshes map[string]*grant
 	access    map[string]*grant
+	pushed    map[string]*pushedRequest
 
 	// Recorded traffic.
-	Authorizes    []Request
-	Tokens        []Request
-	DiscoveryHits int
-	JWKSFetches   int
-	UserinfoHits  int
+	Authorizes       []Request
+	Pushes           []Request
+	RedirectedPushes []Request
+	Tokens           []Request
+	DiscoveryHits    int
+	JWKSFetches      int
+	UserinfoHits     int
 }
 
 // Option configures New.
@@ -192,6 +246,7 @@ func New(t testing.TB, opts ...Option) *IdP {
 		codes:        map[string]*grant{},
 		refreshes:    map[string]*grant{},
 		access:       map[string]*grant{},
+		pushed:       map[string]*pushedRequest{},
 	}
 	mux := http.NewServeMux()
 	idp.server = httptest.NewTLSServer(mux)
@@ -201,6 +256,8 @@ func New(t testing.TB, opts ...Option) *IdP {
 	prefix := strings.TrimPrefix(base, idp.server.URL)
 	mux.HandleFunc(prefix+"/.well-known/openid-configuration", idp.handleDiscovery)
 	mux.HandleFunc(prefix+"/authorize", idp.handleAuthorize)
+	mux.HandleFunc(prefix+"/par", idp.handlePAR)
+	mux.HandleFunc(prefix+"/par-redirected", idp.handleRedirectedPAR)
 	mux.HandleFunc(prefix+"/token", idp.handleToken)
 	mux.HandleFunc(prefix+"/userinfo", idp.handleUserinfo)
 	mux.HandleFunc(prefix+"/jwks", idp.handleJWKS)
@@ -311,6 +368,12 @@ func (idp *IdP) handleDiscovery(w http.ResponseWriter, r *http.Request) {
 		"token_endpoint_auth_methods_supported": []string{"client_secret_basic", "client_secret_post"},
 		"code_challenge_methods_supported":      []string{"S256"},
 	}
+	if idp.PAR || idp.RequirePAR {
+		doc["pushed_authorization_request_endpoint"] = idp.endpoint("par")
+	}
+	if idp.RequirePAR {
+		doc["require_pushed_authorization_requests"] = true
+	}
 	if idp.MutateDiscovery != nil {
 		idp.MutateDiscovery(doc)
 	}
@@ -333,12 +396,37 @@ func (idp *IdP) handleJWKS(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleAuthorize logs in the user named by the test-only "test_user"
-// parameter and redirects back with a code, as a browser would see it.
+// parameter and redirects back with a code, as a browser would see it. A
+// request_uri is resolved to the parameters pushed under it, once.
 func (idp *IdP) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
 	idp.mu.Lock()
 	defer idp.mu.Unlock()
 	idp.Authorizes = append(idp.Authorizes, Request{Query: query})
+	if reference := query.Get("request_uri"); reference != "" {
+		pushed, ok := idp.pushed[reference]
+		delete(idp.pushed, reference)
+		switch {
+		case !ok:
+			http.Error(w, "unknown or used request_uri", http.StatusBadRequest)
+			return
+		case time.Now().After(pushed.expires):
+			http.Error(w, "expired request_uri", http.StatusBadRequest)
+			return
+		case query.Get("client_id") != pushed.clientID:
+			http.Error(w, "request_uri belongs to another client", http.StatusBadRequest)
+			return
+		}
+		login := query.Get("test_user")
+		query = url.Values{}
+		for name, values := range pushed.params {
+			query[name] = slices.Clone(values)
+		}
+		query.Set("test_user", login)
+	} else if idp.RequirePAR {
+		http.Error(w, "pushed authorization request required", http.StatusBadRequest)
+		return
+	}
 	if query.Get("client_id") != idp.ClientID || query.Get("response_type") != "code" {
 		http.Error(w, "bad client or response type", http.StatusBadRequest)
 		return
@@ -436,6 +524,116 @@ func (idp *IdP) handleToken(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unsupported_grant_type"})
 	}
+}
+
+// handlePAR is the RFC 9126 pushed authorization request endpoint. It
+// authenticates the client like the token endpoint, refuses a request_uri
+// parameter, checks the redirect URI, and stores the parameters under a
+// single-use request_uri.
+func (idp *IdP) handlePAR(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request"})
+		return
+	}
+	// A push is recorded before PARDelay, so a test can count one the client
+	// gave up on; it is not processed.
+	idp.mu.Lock()
+	idp.Pushes = append(idp.Pushes, Request{Form: r.PostForm, Authorization: r.Header.Get("Authorization")})
+	idp.mu.Unlock()
+	if !idp.wait(r, func() time.Duration { return idp.PARDelay }) {
+		return
+	}
+	idp.mu.Lock()
+	defer idp.mu.Unlock()
+	switch {
+	case idp.PARRedirect:
+		http.Redirect(w, r, idp.endpoint("par-redirected"), http.StatusTemporaryRedirect)
+		return
+	case idp.PARBody != "":
+		if strings.HasPrefix(idp.PARBody, "{") {
+			w.Header().Set("Content-Type", "application/json")
+		} else {
+			w.Header().Set("Content-Type", "text/plain")
+		}
+		w.WriteHeader(orStatus(idp.PARStatus, http.StatusBadRequest))
+		_, _ = w.Write([]byte(idp.PARBody))
+		return
+	case idp.PARError != "":
+		writeJSON(w, orStatus(idp.PARStatus, http.StatusBadRequest), map[string]string{"error": idp.PARError})
+		return
+	case idp.PARStatus != 0:
+		w.WriteHeader(idp.PARStatus)
+		return
+	}
+	authenticated := idp.clientAuthenticated(r)
+	if idp.PARIgnoreBasicWithClientID && (r.PostForm.Has("client_id") || r.PostForm.Has("client_secret")) {
+		if r.PostForm.Get("client_id") == "" || r.PostForm.Get("client_secret") == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": PocketIDMissingCredentials})
+			return
+		}
+		authenticated = r.PostForm.Get("client_id") == idp.ClientID && r.PostForm.Get("client_secret") == idp.ClientSecret
+	}
+	// RFC 9126 section 2.1: client_id in the form must name the
+	// authenticated client.
+	if !authenticated || (r.PostForm.Has("client_id") && r.PostForm.Get("client_id") != idp.ClientID) {
+		code, errorCode := http.StatusUnauthorized, "invalid_client"
+		if idp.BadClientStatus != 0 {
+			code, errorCode = idp.BadClientStatus, idp.BadClientError
+		}
+		writeJSON(w, code, map[string]string{"error": errorCode})
+		return
+	}
+	if r.PostForm.Has("request_uri") {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request", "error_description": "request_uri is not allowed"})
+		return
+	}
+	if r.PostForm.Get("response_type") != "code" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unsupported_response_type"})
+		return
+	}
+	if len(idp.RedirectURIs) > 0 && !slices.Contains(idp.RedirectURIs, r.PostForm.Get("redirect_uri")) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request", "error_description": "redirect_uri not registered"})
+		return
+	}
+	lifetime := idp.PARLifetime
+	if lifetime <= 0 {
+		lifetime = defaultPARLifetime
+	}
+	params := url.Values{}
+	for name, values := range r.PostForm {
+		if name != "client_secret" {
+			params[name] = slices.Clone(values)
+		}
+	}
+	params.Set("client_id", idp.ClientID)
+	reference := RequestURIPrefix + randomString()
+	idp.pushed[reference] = &pushedRequest{clientID: idp.ClientID, params: params, expires: time.Now().Add(lifetime)}
+	response := map[string]any{"expires_in": int(lifetime.Seconds())}
+	if !idp.OmitRequestURI {
+		response["request_uri"] = reference
+	}
+	writeJSON(w, http.StatusCreated, response)
+}
+
+// handleRedirectedPAR is where PARRedirect points. A client that follows the
+// redirect lands here.
+func (idp *IdP) handleRedirectedPAR(w http.ResponseWriter, r *http.Request) {
+	_ = r.ParseForm()
+	idp.mu.Lock()
+	defer idp.mu.Unlock()
+	idp.RedirectedPushes = append(idp.RedirectedPushes, Request{Form: r.PostForm, Authorization: r.Header.Get("Authorization")})
+	writeJSON(w, http.StatusCreated, map[string]any{"request_uri": RequestURIPrefix + "redirected", "expires_in": 60})
+}
+
+func orStatus(status, fallback int) int {
+	if status != 0 {
+		return status
+	}
+	return fallback
 }
 
 func (idp *IdP) clientAuthenticated(r *http.Request) bool {
@@ -617,6 +815,31 @@ func (idp *IdP) LastAuthorize() Request {
 		return Request{}
 	}
 	return idp.Authorizes[len(idp.Authorizes)-1]
+}
+
+// PushCounts returns how many pushes reached the PAR endpoint and its
+// redirect target.
+func (idp *IdP) PushCounts() (pushes, redirected int) {
+	idp.mu.Lock()
+	defer idp.mu.Unlock()
+	return len(idp.Pushes), len(idp.RedirectedPushes)
+}
+
+// LastPush returns the most recent PAR request.
+func (idp *IdP) LastPush() Request {
+	idp.mu.Lock()
+	defer idp.mu.Unlock()
+	if len(idp.Pushes) == 0 {
+		return Request{}
+	}
+	return idp.Pushes[len(idp.Pushes)-1]
+}
+
+// AuthorizeCount returns how many requests reached the authorize endpoint.
+func (idp *IdP) AuthorizeCount() int {
+	idp.mu.Lock()
+	defer idp.mu.Unlock()
+	return len(idp.Authorizes)
 }
 
 // LastToken returns the most recent token request.
