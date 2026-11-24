@@ -54,6 +54,17 @@ type grant struct {
 	refreshSerial int
 }
 
+type pushedRequest struct {
+	clientID    string
+	state       string
+	nonce       string
+	challenge   string
+	method      string
+	redirectURI string
+	scope       string
+	expiresAt   time.Time
+}
+
 type signingKey struct {
 	alg     jose.SignatureAlgorithm
 	kid     string
@@ -142,17 +153,28 @@ type IdP struct {
 	// unauthorized_client.
 	BadClientStatus int
 	BadClientError  string
+	// EnablePAR advertises pushed_authorization_request_endpoint in discovery.
+	EnablePAR bool
+	// RequirePAR advertises require_pushed_authorization_requests and rejects
+	// authorize calls without a pushed request_uri.
+	RequirePAR bool
+	// PARStatus, when set, makes the PAR endpoint answer with this status.
+	PARStatus int
+	// OmitPARRequestURI omits request_uri from successful PAR answers.
+	OmitPARRequestURI bool
 
-	keys      []*signingKey
-	current   *signingKey
-	foreign   *signingKey
-	serial    int
-	codes     map[string]*grant
-	refreshes map[string]*grant
-	access    map[string]*grant
+	keys        []*signingKey
+	current     *signingKey
+	foreign     *signingKey
+	serial      int
+	codes       map[string]*grant
+	parRequests map[string]*pushedRequest
+	refreshes   map[string]*grant
+	access      map[string]*grant
 
 	// Recorded traffic.
 	Authorizes    []Request
+	PARRequests   []Request
 	Tokens        []Request
 	DiscoveryHits int
 	JWKSFetches   int
@@ -165,6 +187,7 @@ type Option func(*options)
 type options struct {
 	issuerSuffix string
 	alg          jose.SignatureAlgorithm
+	enablePAR    bool
 }
 
 // WithIssuerSuffix appends a path to the issuer, such as "/application/o/silo/".
@@ -175,6 +198,11 @@ func WithIssuerSuffix(suffix string) Option {
 // WithAlgorithm picks the initial signing algorithm (default RS256).
 func WithAlgorithm(alg jose.SignatureAlgorithm) Option {
 	return func(o *options) { o.alg = alg }
+}
+
+// WithPAR enables the pushed authorization request endpoint in discovery.
+func WithPAR() Option {
+	return func(o *options) { o.enablePAR = true }
 }
 
 // New starts a provider; it stops when the test ends.
@@ -188,8 +216,10 @@ func New(t testing.TB, opts ...Option) *IdP {
 		t:            t,
 		ClientID:     "silo",
 		ClientSecret: "test-client-secret-0123456789abcdef",
+		EnablePAR:    o.enablePAR,
 		Users:        map[string]*User{},
 		codes:        map[string]*grant{},
+		parRequests:  map[string]*pushedRequest{},
 		refreshes:    map[string]*grant{},
 		access:       map[string]*grant{},
 	}
@@ -201,6 +231,7 @@ func New(t testing.TB, opts ...Option) *IdP {
 	prefix := strings.TrimPrefix(base, idp.server.URL)
 	mux.HandleFunc(prefix+"/.well-known/openid-configuration", idp.handleDiscovery)
 	mux.HandleFunc(prefix+"/authorize", idp.handleAuthorize)
+	mux.HandleFunc(prefix+"/par", idp.handlePAR)
 	mux.HandleFunc(prefix+"/token", idp.handleToken)
 	mux.HandleFunc(prefix+"/userinfo", idp.handleUserinfo)
 	mux.HandleFunc(prefix+"/jwks", idp.handleJWKS)
@@ -311,6 +342,12 @@ func (idp *IdP) handleDiscovery(w http.ResponseWriter, r *http.Request) {
 		"token_endpoint_auth_methods_supported": []string{"client_secret_basic", "client_secret_post"},
 		"code_challenge_methods_supported":      []string{"S256"},
 	}
+	if idp.EnablePAR {
+		doc["pushed_authorization_request_endpoint"] = idp.endpoint("par")
+	}
+	if idp.RequirePAR {
+		doc["require_pushed_authorization_requests"] = true
+	}
 	if idp.MutateDiscovery != nil {
 		idp.MutateDiscovery(doc)
 	}
@@ -332,6 +369,65 @@ func (idp *IdP) handleJWKS(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, set)
 }
 
+func (idp *IdP) handlePAR(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "invalid_request"})
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request"})
+		return
+	}
+	idp.mu.Lock()
+	defer idp.mu.Unlock()
+	idp.PARRequests = append(idp.PARRequests, Request{Form: r.PostForm, Authorization: r.Header.Get("Authorization")})
+	if idp.PARStatus != 0 {
+		errCode := "invalid_request"
+		if idp.PARStatus >= 500 {
+			errCode = "server_error"
+		}
+		writeJSON(w, idp.PARStatus, map[string]string{"error": errCode})
+		return
+	}
+	if !idp.clientAuthenticated(r) {
+		code, errorCode := http.StatusUnauthorized, "invalid_client"
+		if idp.BadClientStatus != 0 {
+			code, errorCode = idp.BadClientStatus, idp.BadClientError
+		}
+		writeJSON(w, code, map[string]string{"error": errorCode})
+		return
+	}
+	if r.PostForm.Get("client_id") != idp.ClientID || r.PostForm.Get("response_type") != "code" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request", "error_description": "bad client or response type"})
+		return
+	}
+	redirectURI := r.PostForm.Get("redirect_uri")
+	if len(idp.RedirectURIs) > 0 && !slices.Contains(idp.RedirectURIs, redirectURI) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request", "error_description": "redirect_uri not registered"})
+		return
+	}
+	if r.PostForm.Get("code_challenge_method") != "S256" || r.PostForm.Get("code_challenge") == "" || r.PostForm.Get("nonce") == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request", "error_description": "PKCE S256 and nonce are required"})
+		return
+	}
+	if idp.OmitPARRequestURI {
+		writeJSON(w, http.StatusCreated, map[string]any{"expires_in": 60})
+		return
+	}
+	requestURI := "urn:ietf:params:oauth:request_uri:" + randomString()
+	idp.parRequests[requestURI] = &pushedRequest{
+		clientID:    idp.ClientID,
+		state:       r.PostForm.Get("state"),
+		nonce:       r.PostForm.Get("nonce"),
+		challenge:   r.PostForm.Get("code_challenge"),
+		method:      r.PostForm.Get("code_challenge_method"),
+		redirectURI: redirectURI,
+		scope:       r.PostForm.Get("scope"),
+		expiresAt:   time.Now().Add(time.Minute),
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"request_uri": requestURI, "expires_in": 60})
+}
+
 // handleAuthorize logs in the user named by the test-only "test_user"
 // parameter and redirects back with a code, as a browser would see it.
 func (idp *IdP) handleAuthorize(w http.ResponseWriter, r *http.Request) {
@@ -339,14 +435,50 @@ func (idp *IdP) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	idp.mu.Lock()
 	defer idp.mu.Unlock()
 	idp.Authorizes = append(idp.Authorizes, Request{Query: query})
-	if query.Get("client_id") != idp.ClientID || query.Get("response_type") != "code" {
-		http.Error(w, "bad client or response type", http.StatusBadRequest)
+	if query.Get("client_id") != idp.ClientID {
+		http.Error(w, "bad client", http.StatusBadRequest)
 		return
 	}
-	redirectURI := query.Get("redirect_uri")
-	if len(idp.RedirectURIs) > 0 && !slices.Contains(idp.RedirectURIs, redirectURI) {
-		http.Error(w, "redirect_uri not registered", http.StatusBadRequest)
-		return
+	var (
+		redirectURI string
+		state       string
+		nonce       string
+		challenge   string
+		method      string
+		scope       string
+	)
+	if requestURI := query.Get("request_uri"); requestURI != "" {
+		pushed, ok := idp.parRequests[requestURI]
+		delete(idp.parRequests, requestURI)
+		if !ok || pushed.clientID != query.Get("client_id") || time.Now().After(pushed.expiresAt) {
+			http.Error(w, "invalid request_uri", http.StatusBadRequest)
+			return
+		}
+		redirectURI = pushed.redirectURI
+		state = pushed.state
+		nonce = pushed.nonce
+		challenge = pushed.challenge
+		method = pushed.method
+		scope = pushed.scope
+	} else {
+		if idp.RequirePAR {
+			http.Error(w, "request_uri is required", http.StatusBadRequest)
+			return
+		}
+		if query.Get("response_type") != "code" {
+			http.Error(w, "bad response type", http.StatusBadRequest)
+			return
+		}
+		redirectURI = query.Get("redirect_uri")
+		if len(idp.RedirectURIs) > 0 && !slices.Contains(idp.RedirectURIs, redirectURI) {
+			http.Error(w, "redirect_uri not registered", http.StatusBadRequest)
+			return
+		}
+		state = query.Get("state")
+		nonce = query.Get("nonce")
+		challenge = query.Get("code_challenge")
+		method = query.Get("code_challenge_method")
+		scope = query.Get("scope")
 	}
 	if _, ok := idp.Users[query.Get("test_user")]; !ok {
 		http.Error(w, "unknown test_user", http.StatusBadRequest)
@@ -355,16 +487,16 @@ func (idp *IdP) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	code := randomString()
 	idp.codes[code] = &grant{
 		user:        query.Get("test_user"),
-		nonce:       query.Get("nonce"),
-		challenge:   query.Get("code_challenge"),
-		method:      query.Get("code_challenge_method"),
+		nonce:       nonce,
+		challenge:   challenge,
+		method:      method,
 		redirectURI: redirectURI,
-		scope:       query.Get("scope"),
+		scope:       scope,
 	}
 	target, _ := url.Parse(redirectURI)
 	values := target.Query()
 	values.Set("code", code)
-	values.Set("state", query.Get("state"))
+	values.Set("state", state)
 	target.RawQuery = values.Encode()
 	http.Redirect(w, r, target.String(), http.StatusFound)
 }
@@ -617,6 +749,16 @@ func (idp *IdP) LastAuthorize() Request {
 		return Request{}
 	}
 	return idp.Authorizes[len(idp.Authorizes)-1]
+}
+
+// LastPAR returns the most recent pushed authorization request.
+func (idp *IdP) LastPAR() Request {
+	idp.mu.Lock()
+	defer idp.mu.Unlock()
+	if len(idp.PARRequests) == 0 {
+		return Request{}
+	}
+	return idp.PARRequests[len(idp.PARRequests)-1]
 }
 
 // LastToken returns the most recent token request.

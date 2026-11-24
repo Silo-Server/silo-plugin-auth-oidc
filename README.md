@@ -16,7 +16,8 @@ role, and manages sessions. The plugin holds no Silo account logic.
   `issuer` to match the setting exactly. A trailing slash is significant
   (authentik's issuer has one).
 - Sends PKCE S256 and a nonce on every sign-in, whatever the provider
-  advertises.
+  advertises. Uses Pushed Authorization Requests (PAR, RFC 9126) automatically
+  when the provider advertises `pushed_authorization_request_endpoint`.
 - Validates the ID token: signature, `iss`, `aud` and `azp`, `exp`, `iat`,
   `nbf`, and `nonce`. It accepts RS256/384/512, PS256/384/512,
   ES256/384/512, and EdDSA. HS256 (signed with the client secret) is refused
@@ -114,6 +115,7 @@ certificate authority, paste the CA certificate into **Custom CA certificate**.
 | | `refresh_token_max_lifetime` | blank (none) | The provider's absolute refresh-token cap counted from sign-in, in the same format. A refusal at or after it counts as expiry. Blank or `0` means none. |
 | | `prompt` | provider default | `login`, `select_account`, or `consent`. |
 | | `provider_logout` | off | End the provider session on web sign-out. Register Silo's sign-in page as a post-logout redirect URI. |
+| | `pushed_authorization_requests` | automatic | `""` (when advertised), `required`, or `disabled`. Sends sign-in parameters to `pushed_authorization_request_endpoint` over HTTPS. |
 | | `ca_pem` | | Extra trusted CA certificates. |
 | | `allow_hs256` | off | Accept HS256 ID tokens. |
 | Claim mapping | `username`, `email`, `display_name`, `groups`, `picture` | `preferred_username`, `email`, `name`, `groups`, `picture` | Claim paths; dots walk into nested objects. |

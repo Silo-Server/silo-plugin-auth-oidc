@@ -124,7 +124,7 @@
       "key": "connection",
       "title": "Provider connection",
       "description": "Where the OpenID Connect provider is and how Silo authenticates to it. The redirect URI to register at the provider is shown on the Sign-in settings page.",
-      "json_schema": "{\"type\":\"object\",\"properties\":{\"issuer_url\":{\"type\":\"string\"},\"client_id\":{\"type\":\"string\"},\"client_secret\":{\"type\":\"string\",\"writeOnly\":true},\"token_endpoint_auth_method\":{\"type\":\"string\",\"enum\":[\"client_secret_basic\",\"client_secret_post\"]},\"scopes\":{\"type\":\"string\"},\"request_groups_scope\":{\"type\":\"boolean\"},\"request_offline_access\":{\"type\":\"boolean\"},\"refresh_token_lifetime\":{\"type\":\"string\",\"maxLength\":16,\"pattern\":\"^\\\\s*(0|([0-9]{1,4})d|(?:([0-9]{1,6})h)?(?:([0-9]{1,7})m)?)\\\\s*$\"},\"refresh_token_max_lifetime\":{\"type\":\"string\",\"maxLength\":16,\"pattern\":\"^\\\\s*(0|([0-9]{1,4})d|(?:([0-9]{1,6})h)?(?:([0-9]{1,7})m)?)\\\\s*$\"},\"prompt\":{\"type\":\"string\",\"enum\":[\"\",\"login\",\"select_account\",\"consent\"]},\"provider_logout\":{\"type\":\"boolean\"},\"ca_pem\":{\"type\":\"string\"},\"allow_hs256\":{\"type\":\"boolean\"}},\"additionalProperties\":false}",
+      "json_schema": "{\"type\":\"object\",\"properties\":{\"issuer_url\":{\"type\":\"string\"},\"client_id\":{\"type\":\"string\"},\"client_secret\":{\"type\":\"string\",\"writeOnly\":true},\"token_endpoint_auth_method\":{\"type\":\"string\",\"enum\":[\"client_secret_basic\",\"client_secret_post\"]},\"scopes\":{\"type\":\"string\"},\"request_groups_scope\":{\"type\":\"boolean\"},\"request_offline_access\":{\"type\":\"boolean\"},\"refresh_token_lifetime\":{\"type\":\"string\",\"maxLength\":16,\"pattern\":\"^\\\\s*(0|([0-9]{1,4})d|(?:([0-9]{1,6})h)?(?:([0-9]{1,7})m)?)\\\\s*$\"},\"refresh_token_max_lifetime\":{\"type\":\"string\",\"maxLength\":16,\"pattern\":\"^\\\\s*(0|([0-9]{1,4})d|(?:([0-9]{1,6})h)?(?:([0-9]{1,7})m)?)\\\\s*$\"},\"prompt\":{\"type\":\"string\",\"enum\":[\"\",\"login\",\"select_account\",\"consent\"]},\"provider_logout\":{\"type\":\"boolean\"},\"pushed_authorization_requests\":{\"type\":\"string\",\"enum\":[\"\",\"required\",\"disabled\"]},\"ca_pem\":{\"type\":\"string\"},\"allow_hs256\":{\"type\":\"boolean\"}},\"additionalProperties\":false}",
       "required": true,
       "admin_form": {
         "submit_label": "Save connection",
@@ -259,6 +259,27 @@
             "control": "ADMIN_FORM_CONTROL_SWITCH",
             "default_value": false,
             "description": "Accept ID tokens signed with the client secret. Only for providers without a signing key, such as an authentik provider with no signing key set. Prefer configuring a signing key."
+          },
+          {
+            "key": "pushed_authorization_requests",
+            "label": "Pushed authorization requests (PAR)",
+            "control": "ADMIN_FORM_CONTROL_SELECT",
+            "default_value": "",
+            "description": "Sends sign-in parameters directly to the provider over HTTPS (RFC 9126) instead of in the browser redirect URL.",
+            "options": [
+              {
+                "value": "",
+                "label": "Automatic (when advertised by the provider)"
+              },
+              {
+                "value": "required",
+                "label": "Always require PAR"
+              },
+              {
+                "value": "disabled",
+                "label": "Disabled"
+              }
+            ]
           }
         ],
         "sections": [
@@ -291,6 +312,7 @@
             "collapsible": true,
             "collapsed_default": true,
             "field_keys": [
+              "pushed_authorization_requests",
               "ca_pem",
               "allow_hs256"
             ]

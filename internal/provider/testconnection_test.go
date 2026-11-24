@@ -176,6 +176,80 @@ func TestTestConnectionFailures(t *testing.T) {
 	}
 }
 
+func TestTestConnectionPAR(t *testing.T) {
+	t.Run("advertised PAR is reported as used", func(t *testing.T) {
+		idp := newIdP(t, oidctest.WithPAR())
+		resp := runTest(t, New(nil), baseSettings(idp))
+		if !resp.GetOk() {
+			t.Fatalf("connection test failed: %+v", resp.GetSteps())
+		}
+		if msg := stepsByID(resp)[stepEndpoints].GetMessage(); !strings.Contains(msg, "PAR") || !strings.Contains(msg, "used") {
+			t.Errorf("endpoints message = %q", msg)
+		}
+	})
+	t.Run("disabled PAR is reported when advertised", func(t *testing.T) {
+		idp := newIdP(t, oidctest.WithPAR())
+		cfg := baseSettings(idp)
+		cfg.connection["pushed_authorization_requests"] = PARDisabled
+		resp := runTest(t, New(nil), cfg)
+		if !resp.GetOk() {
+			t.Fatalf("connection test failed: %+v", resp.GetSteps())
+		}
+		if msg := stepsByID(resp)[stepEndpoints].GetMessage(); !strings.Contains(msg, "disabled") {
+			t.Errorf("endpoints message = %q", msg)
+		}
+	})
+	for _, tc := range []struct {
+		name string
+		edit func(idp *oidctest.IdP, cfg settings)
+		want string
+	}{
+		{
+			name: "required without discovery endpoint",
+			edit: func(_ *oidctest.IdP, cfg settings) { cfg.connection["pushed_authorization_requests"] = PARRequired },
+			want: "pushed_authorization_request_endpoint",
+		},
+		{
+			name: "provider requires PAR without discovery endpoint",
+			edit: func(idp *oidctest.IdP, _ settings) { idp.Set(func(idp *oidctest.IdP) { idp.RequirePAR = true }) },
+			want: "pushed_authorization_request_endpoint",
+		},
+		{
+			name: "provider requires PAR while disabled",
+			edit: func(idp *oidctest.IdP, cfg settings) {
+				idp.Set(func(idp *oidctest.IdP) { idp.EnablePAR, idp.RequirePAR = true, true })
+				cfg.connection["pushed_authorization_requests"] = PARDisabled
+			},
+			want: "disabled",
+		},
+		{
+			name: "http PAR endpoint rejected",
+			edit: func(idp *oidctest.IdP, _ settings) {
+				idp.Set(func(idp *oidctest.IdP) {
+					idp.MutateDiscovery = func(doc map[string]any) {
+						doc["pushed_authorization_request_endpoint"] = "http://idp.example/par"
+					}
+				})
+			},
+			want: "https",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			idp := newIdP(t)
+			cfg := baseSettings(idp)
+			tc.edit(idp, cfg)
+			resp := runTest(t, New(nil), cfg)
+			if resp.GetOk() {
+				t.Fatalf("connection test passed; want failure at %s", stepEndpoints)
+			}
+			last := lastStep(resp)
+			if last.GetId() != stepEndpoints || !strings.Contains(last.GetMessage(), tc.want) {
+				t.Fatalf("last step = %+v, want %s mentioning %q", last, stepEndpoints, tc.want)
+			}
+		})
+	}
+}
+
 func TestTestConnectionIssuerMismatchHint(t *testing.T) {
 	idp := newIdP(t, oidctest.WithIssuerSuffix("/application/o/silo/"))
 	cfg := baseSettings(idp)

@@ -86,16 +86,24 @@ type Settings struct {
 
 // Discovery is the subset of the OpenID Provider metadata the client uses.
 type Discovery struct {
-	Issuer                            string   `json:"issuer"`
-	AuthorizationEndpoint             string   `json:"authorization_endpoint"`
-	TokenEndpoint                     string   `json:"token_endpoint"`
-	UserinfoEndpoint                  string   `json:"userinfo_endpoint"`
-	JWKSURI                           string   `json:"jwks_uri"`
-	EndSessionEndpoint                string   `json:"end_session_endpoint"`
-	ScopesSupported                   []string `json:"scopes_supported"`
-	TokenEndpointAuthMethodsSupported []string `json:"token_endpoint_auth_methods_supported"`
-	IDTokenSigningAlgValuesSupported  []string `json:"id_token_signing_alg_values_supported"`
-	CodeChallengeMethodsSupported     []string `json:"code_challenge_methods_supported"`
+	Issuer                             string   `json:"issuer"`
+	AuthorizationEndpoint              string   `json:"authorization_endpoint"`
+	TokenEndpoint                      string   `json:"token_endpoint"`
+	PushedAuthorizationRequestEndpoint string   `json:"pushed_authorization_request_endpoint"`
+	RequirePushedAuthorizationRequests bool     `json:"require_pushed_authorization_requests"`
+	UserinfoEndpoint                   string   `json:"userinfo_endpoint"`
+	JWKSURI                            string   `json:"jwks_uri"`
+	EndSessionEndpoint                 string   `json:"end_session_endpoint"`
+	ScopesSupported                    []string `json:"scopes_supported"`
+	TokenEndpointAuthMethodsSupported  []string `json:"token_endpoint_auth_methods_supported"`
+	IDTokenSigningAlgValuesSupported   []string `json:"id_token_signing_alg_values_supported"`
+	CodeChallengeMethodsSupported      []string `json:"code_challenge_methods_supported"`
+}
+
+// PARResponse is a successful pushed authorization request answer (RFC 9126).
+type PARResponse struct {
+	RequestURI string         `json:"request_uri"`
+	ExpiresIn  lenientSeconds `json:"expires_in"`
 }
 
 // TokenResponse is a successful token endpoint answer.
@@ -308,6 +316,7 @@ func ValidateDiscovery(doc *Discovery, issuer string) error {
 		}
 	}
 	for _, endpoint := range []struct{ name, value string }{
+		{"pushed_authorization_request_endpoint", doc.PushedAuthorizationRequestEndpoint},
 		{"userinfo_endpoint", doc.UserinfoEndpoint},
 		{"end_session_endpoint", doc.EndSessionEndpoint},
 	} {
@@ -370,6 +379,25 @@ type AuthRequest struct {
 	LoginHint     string
 }
 
+func (r AuthRequest) formValues(clientID string) url.Values {
+	values := url.Values{}
+	values.Set("response_type", "code")
+	values.Set("client_id", clientID)
+	values.Set("redirect_uri", r.RedirectURI)
+	values.Set("scope", strings.Join(r.Scopes, " "))
+	values.Set("state", r.State)
+	values.Set("nonce", r.Nonce)
+	values.Set("code_challenge", r.CodeChallenge)
+	values.Set("code_challenge_method", "S256")
+	if r.Prompt != "" {
+		values.Set("prompt", r.Prompt)
+	}
+	if r.LoginHint != "" {
+		values.Set("login_hint", r.LoginHint)
+	}
+	return values
+}
+
 // AuthCodeURL builds the authorization URL. PKCE S256 and the nonce are always
 // sent, whatever discovery advertises.
 func (c *Client) AuthCodeURL(doc *Discovery, request AuthRequest) (string, error) {
@@ -378,20 +406,47 @@ func (c *Client) AuthCodeURL(doc *Discovery, request AuthRequest) (string, error
 		return "", fmt.Errorf("%w: authorization endpoint: %v", ErrConfig, err)
 	}
 	query := endpoint.Query()
-	query.Set("response_type", "code")
+	for key, values := range request.formValues(c.settings.ClientID) {
+		for _, value := range values {
+			query.Set(key, value)
+		}
+	}
+	endpoint.RawQuery = query.Encode()
+	return endpoint.String(), nil
+}
+
+// PushAuth pushes the authorization request to the provider's PAR endpoint
+// (RFC 9126) and returns the authorization URL referencing the returned
+// request_uri.
+func (c *Client) PushAuth(ctx context.Context, doc *Discovery, request AuthRequest) (string, error) {
+	if doc.PushedAuthorizationRequestEndpoint == "" {
+		return "", fmt.Errorf("%w: discovery has no pushed_authorization_request_endpoint", ErrConfig)
+	}
+	endpoint, err := url.Parse(doc.AuthorizationEndpoint)
+	if err != nil {
+		return "", fmt.Errorf("%w: authorization endpoint: %v", ErrConfig, err)
+	}
+	var par PARResponse
+	err = c.postAuthForm(ctx, "pushed authorization endpoint", doc.PushedAuthorizationRequestEndpoint,
+		request.formValues(c.settings.ClientID), []int{http.StatusCreated, http.StatusOK}, &par)
+	if err != nil {
+		var tokenErr *TokenError
+		if errors.As(err, &tokenErr) {
+			if tokenErr.Description != "" {
+				return "", fmt.Errorf("%w: pushed authorization request rejected (%d %s: %s)",
+					ErrConfig, tokenErr.Status, tokenErr.Code, tokenErr.Description)
+			}
+			return "", fmt.Errorf("%w: pushed authorization request rejected (%d %s)",
+				ErrConfig, tokenErr.Status, tokenErr.Code)
+		}
+		return "", err
+	}
+	if par.RequestURI == "" {
+		return "", fmt.Errorf("%w: pushed authorization response has no request_uri", ErrConfig)
+	}
+	query := endpoint.Query()
 	query.Set("client_id", c.settings.ClientID)
-	query.Set("redirect_uri", request.RedirectURI)
-	query.Set("scope", strings.Join(request.Scopes, " "))
-	query.Set("state", request.State)
-	query.Set("nonce", request.Nonce)
-	query.Set("code_challenge", request.CodeChallenge)
-	query.Set("code_challenge_method", "S256")
-	if request.Prompt != "" {
-		query.Set("prompt", request.Prompt)
-	}
-	if request.LoginHint != "" {
-		query.Set("login_hint", request.LoginHint)
-	}
+	query.Set("request_uri", par.RequestURI)
 	endpoint.RawQuery = query.Encode()
 	return endpoint.String(), nil
 }
@@ -477,6 +532,14 @@ func (c *Client) token(ctx context.Context, form url.Values) (*TokenResponse, er
 	if err != nil {
 		return nil, err
 	}
+	var token TokenResponse
+	if err := c.postAuthForm(ctx, "token endpoint", doc.TokenEndpoint, form, []int{http.StatusOK}, &token); err != nil {
+		return nil, err
+	}
+	return &token, nil
+}
+
+func (c *Client) postAuthForm(ctx context.Context, endpointName, endpointURL string, form url.Values, okStatuses []int, target any) error {
 	headers := http.Header{}
 	switch c.settings.TokenAuthMethod {
 	case AuthMethodPost:
@@ -493,26 +556,26 @@ func (c *Client) token(ctx context.Context, form url.Values) (*TokenResponse, er
 				url.QueryEscape(c.settings.ClientID), url.QueryEscape(c.settings.ClientSecret)))
 		}
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, doc.TokenEndpoint, strings.NewReader(form.Encode()))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpointURL, strings.NewReader(form.Encode()))
 	if err != nil {
-		return nil, fmt.Errorf("%w: token endpoint: %v", ErrConfig, err)
+		return fmt.Errorf("%w: %s: %v", ErrConfig, endpointName, err)
 	}
 	req.Header = headers
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("%w: token request: %v", ErrUnavailable, redactURLError(err))
+		return fmt.Errorf("%w: %s request: %v", ErrUnavailable, endpointName, redactURLError(err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if err != nil {
-		return nil, fmt.Errorf("%w: token response: %v", ErrUnavailable, err)
+		return fmt.Errorf("%w: %s response: %v", ErrUnavailable, endpointName, err)
 	}
 	if resp.StatusCode >= 500 {
-		return nil, fmt.Errorf("%w: token endpoint answered %d", ErrUnavailable, resp.StatusCode)
+		return fmt.Errorf("%w: %s answered %d", ErrUnavailable, endpointName, resp.StatusCode)
 	}
-	if resp.StatusCode != http.StatusOK {
+	if !slices.Contains(okStatuses, resp.StatusCode) {
 		var oauthErr struct {
 			Error            string `json:"error"`
 			ErrorDescription string `json:"error_description"`
@@ -525,13 +588,12 @@ func (c *Client) token(ctx context.Context, form url.Values) (*TokenResponse, er
 		if code == "" {
 			code = "unknown_error"
 		}
-		return nil, &TokenError{Status: resp.StatusCode, Code: code, Description: truncate(oauthErr.ErrorDescription, 200)}
+		return &TokenError{Status: resp.StatusCode, Code: code, Description: truncate(oauthErr.ErrorDescription, 200)}
 	}
-	var token TokenResponse
-	if err := json.Unmarshal(body, &token); err != nil {
-		return nil, fmt.Errorf("%w: token response is not JSON: %v", ErrConfig, err)
+	if err := json.Unmarshal(body, target); err != nil {
+		return fmt.Errorf("%w: %s response is not JSON: %v", ErrConfig, endpointName, err)
 	}
-	return &token, nil
+	return nil
 }
 
 // UserInfo fetches the userinfo claims with an access token. It accepts plain

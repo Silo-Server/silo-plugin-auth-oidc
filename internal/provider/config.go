@@ -28,6 +28,13 @@ const (
 	SubjectEntra    = "entra"
 )
 
+// Pushed authorization request (PAR) modes.
+const (
+	PARAuto     = ""
+	PARRequired = "required"
+	PARDisabled = "disabled"
+)
+
 // Default claim names.
 const (
 	defaultScopes           = "openid profile email"
@@ -54,6 +61,7 @@ type Config struct {
 	ProviderLogout       bool
 	CAPEM                string
 	AllowHS256           bool
+	PARMode              string
 	// RefreshTokenLifetime is the provider's per-token (sliding or idle)
 	// refresh-token lifetime as the operator entered it, or zero when
 	// unknown. It tells an expired refresh token from a revoked one when the
@@ -122,6 +130,7 @@ func ParseConfig(entries []*pluginv1.ConfigEntry) (Config, error) {
 	readBool(keyConnection, "provider_logout", &cfg.ProviderLogout)
 	read(keyConnection, "ca_pem", &cfg.CAPEM)
 	readBool(keyConnection, "allow_hs256", &cfg.AllowHS256)
+	read(keyConnection, "pushed_authorization_requests", &cfg.PARMode)
 	var refreshLifetime, refreshMaxLifetime string
 	read(keyConnection, "refresh_token_lifetime", &refreshLifetime)
 	read(keyConnection, "refresh_token_max_lifetime", &refreshMaxLifetime)
@@ -153,6 +162,7 @@ func ParseConfig(entries []*pluginv1.ConfigEntry) (Config, error) {
 	}
 	cfg.Scopes = strings.Fields(scopes)
 	cfg.Prompt = strings.TrimSpace(cfg.Prompt)
+	cfg.PARMode = strings.TrimSpace(cfg.PARMode)
 	cfg.UsernameClaim = orDefault(cfg.UsernameClaim, defaultUsernameClaim)
 	cfg.EmailClaim = orDefault(cfg.EmailClaim, defaultEmailClaim)
 	cfg.DisplayNameClaim = orDefault(cfg.DisplayNameClaim, defaultDisplayNameClaim)
@@ -240,6 +250,11 @@ func (c Config) Problems() []string {
 	case SubjectAuto, SubjectStandard, SubjectEntra:
 	default:
 		problems = append(problems, fmt.Sprintf("Account key %q is not supported.", c.SubjectMode))
+	}
+	switch c.PARMode {
+	case PARAuto, PARRequired, PARDisabled:
+	default:
+		problems = append(problems, fmt.Sprintf("Pushed authorization requests mode %q is not supported.", c.PARMode))
 	}
 	if c.AllowHS256 && c.ClientSecret == "" {
 		problems = append(problems, "HS256 ID tokens need a client secret.")

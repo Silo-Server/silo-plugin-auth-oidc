@@ -75,9 +75,25 @@ func (p *Provider) TestConnection(ctx context.Context, req *pluginv1.AuthTestCon
 		run.fail(stepEndpoints, "Endpoints present", err.Error())
 		return run.response(), nil
 	}
+	if (cfg.PARMode == PARRequired || (cfg.PARMode == PARAuto && doc.RequirePushedAuthorizationRequests)) &&
+		doc.PushedAuthorizationRequestEndpoint == "" {
+		run.fail(stepEndpoints, "Endpoints present", "Pushed authorization requests are required, but discovery has no pushed_authorization_request_endpoint.")
+		return run.response(), nil
+	}
+	if cfg.PARMode == PARDisabled && doc.RequirePushedAuthorizationRequests {
+		run.fail(stepEndpoints, "Endpoints present", "The provider requires pushed authorization requests, but Pushed authorization requests is disabled.")
+		return run.response(), nil
+	}
 	endpointMessage := "Authorization, token and JWKS endpoints use https."
 	if doc.UserinfoEndpoint == "" {
 		endpointMessage += " The provider has no userinfo endpoint, so only ID token claims are used."
+	}
+	if doc.PushedAuthorizationRequestEndpoint != "" {
+		if cfg.PARMode == PARDisabled {
+			endpointMessage += " The provider advertises PAR, which is disabled in settings."
+		} else {
+			endpointMessage += " Pushed authorization requests (PAR) will be used."
+		}
 	}
 	run.pass(stepEndpoints, "Endpoints present", endpointMessage)
 

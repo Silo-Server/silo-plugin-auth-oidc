@@ -194,9 +194,9 @@ func TestParseConfig(t *testing.T) {
 	if err != nil || len(empty.Problems()) == 0 {
 		t.Errorf("empty config: err = %v, problems = %v", err, empty.Problems())
 	}
-	bad := Config{Issuer: "https://x", ClientID: "c", TokenAuthMethod: "private_key_jwt", SubjectMode: "weird", Prompt: "none login", AllowHS256: true}
-	if got := len(bad.Problems()); got != 4 {
-		t.Errorf("problems = %v, want 4", bad.Problems())
+	bad := Config{Issuer: "https://x", ClientID: "c", TokenAuthMethod: "private_key_jwt", SubjectMode: "weird", Prompt: "none login", AllowHS256: true, PARMode: "bogus"}
+	if got := len(bad.Problems()); got != 5 {
+		t.Errorf("problems = %v, want 5", bad.Problems())
 	}
 }
 

@@ -94,10 +94,16 @@ func TestManifestConfigSchema(t *testing.T) {
 		"issuer_url": "https://idp.example", "client_id": "silo", "client_secret": "s",
 		"token_endpoint_auth_method": "client_secret_basic", "scopes": "openid profile email",
 		"request_groups_scope": true, "request_offline_access": false, "prompt": "",
-		"provider_logout": false, "ca_pem": "", "allow_hs256": false, "refresh_token_lifetime": "30d",
+		"provider_logout": false, "pushed_authorization_requests": "", "ca_pem": "", "allow_hs256": false, "refresh_token_lifetime": "30d",
 	}
 	if err := publicconfig.ValidateManifestGlobalValue(m, "connection", valid); err != nil {
 		t.Errorf("connection value: %v", err)
+	}
+	for mode, ok := range map[string]bool{"": true, "required": true, "disabled": true, "bogus": false} {
+		edited := map[string]any{"issuer_url": "https://idp.example", "client_id": "silo", "pushed_authorization_requests": mode}
+		if err := publicconfig.ValidateManifestGlobalValue(m, "connection", edited); (err == nil) != ok {
+			t.Errorf("pushed_authorization_requests %q: validation error %v, want accepted = %v", mode, err, ok)
+		}
 	}
 	var schema map[string]any
 	if err := json.Unmarshal([]byte(keys["connection"].GetJsonSchema()), &schema); err != nil {

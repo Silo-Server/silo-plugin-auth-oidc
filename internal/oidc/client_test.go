@@ -1,9 +1,15 @@
 package oidc
 
 import (
+	"context"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -44,6 +50,16 @@ func TestValidateDiscovery(t *testing.T) {
 	noUserinfoHTTPS.UserinfoEndpoint = "http://idp.example/userinfo"
 	if err := ValidateDiscovery(&noUserinfoHTTPS, good.Issuer); !errors.Is(err, ErrConfig) {
 		t.Errorf("http userinfo endpoint accepted: %v", err)
+	}
+	withPAR := good
+	withPAR.PushedAuthorizationRequestEndpoint = "https://idp.example/par"
+	if err := ValidateDiscovery(&withPAR, good.Issuer); err != nil {
+		t.Fatalf("valid PAR discovery: %v", err)
+	}
+	noPARHTTPS := good
+	noPARHTTPS.PushedAuthorizationRequestEndpoint = "http://idp.example/par"
+	if err := ValidateDiscovery(&noPARHTTPS, good.Issuer); !errors.Is(err, ErrConfig) {
+		t.Errorf("http PAR endpoint accepted: %v", err)
 	}
 }
 
@@ -112,5 +128,95 @@ func TestTokenResponseScopeAndExpiry(t *testing.T) {
 func TestErrSubjectMismatchIsInvalidToken(t *testing.T) {
 	if !errors.Is(ErrSubjectMismatch, ErrInvalidToken) {
 		t.Fatal("ErrSubjectMismatch must wrap ErrInvalidToken so sign-in still refuses it")
+	}
+}
+
+func TestPushAuth(t *testing.T) {
+	var status int
+	var body string
+	var gotForm url.Values
+	var gotAuth string
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		gotForm = r.PostForm
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	caPEM := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw}))
+	cert, _ := x509.ParseCertificate(srv.Certificate().Raw)
+	if cert == nil {
+		t.Fatal("failed to parse test cert")
+	}
+	client, err := NewClient(Settings{
+		Issuer:       srv.URL,
+		ClientID:     "silo",
+		ClientSecret: "secret",
+		CAPEM:        caPEM,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc := &Discovery{
+		Issuer:                             srv.URL,
+		AuthorizationEndpoint:              srv.URL + "/authorize?acr=1",
+		TokenEndpoint:                      srv.URL + "/token",
+		JWKSURI:                            srv.URL + "/jwks",
+		PushedAuthorizationRequestEndpoint: srv.URL + "/par",
+	}
+	req := AuthRequest{
+		RedirectURI:   "https://silo.example/cb",
+		State:         "st",
+		Nonce:         "nn",
+		CodeChallenge: "cc",
+		Scopes:        []string{"openid", "profile"},
+		Prompt:        "login",
+		LoginHint:     "alice@example.com",
+	}
+
+	status, body = http.StatusCreated, `{"request_uri":"urn:ietf:params:oauth:request_uri:abc","expires_in":90}`
+	authURL, err := client.PushAuth(context.Background(), doc, req)
+	if err != nil {
+		t.Fatalf("PushAuth: %v", err)
+	}
+	if !strings.HasPrefix(gotAuth, "Basic ") || gotForm.Get("client_secret") != "" {
+		t.Errorf("auth = %q, form secret = %q", gotAuth, gotForm.Get("client_secret"))
+	}
+	if gotForm.Get("code_challenge_method") != "S256" || gotForm.Get("nonce") != "nn" || gotForm.Get("login_hint") != "alice@example.com" {
+		t.Errorf("PAR form = %v", gotForm)
+	}
+	parsed, err := url.Parse(authURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := parsed.Query()
+	if q.Get("client_id") != "silo" || q.Get("request_uri") != "urn:ietf:params:oauth:request_uri:abc" || q.Get("acr") != "1" {
+		t.Errorf("authorize query = %v", q)
+	}
+	for _, stripped := range []string{"redirect_uri", "state", "nonce", "code_challenge", "scope", "prompt", "login_hint"} {
+		if q.Has(stripped) {
+			t.Errorf("authorize query should not carry %q when using PAR", stripped)
+		}
+	}
+
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+		want   error
+	}{
+		{"missing request_uri", http.StatusCreated, `{"expires_in":90}`, ErrConfig},
+		{"400 invalid_request", http.StatusBadRequest, `{"error":"invalid_request","error_description":"bad redirect"}`, ErrConfig},
+		{"502 server_error", http.StatusBadGateway, `{"error":"server_error"}`, ErrUnavailable},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			status, body = tc.status, tc.body
+			if _, err := client.PushAuth(context.Background(), doc, req); !errors.Is(err, tc.want) {
+				t.Errorf("err = %v, want %v", err, tc.want)
+			}
+		})
 	}
 }

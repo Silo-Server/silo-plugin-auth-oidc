@@ -757,6 +757,141 @@ func TestEachAuthorizationUsesFreshPKCEAndNonce(t *testing.T) {
 	}
 }
 
+func TestPARSignInHappyPath(t *testing.T) {
+	idp := newIdP(t, oidctest.WithPAR())
+	cfg := baseSettings(idp)
+	cfg.connection["prompt"] = "select_account"
+	p := newProvider(t, cfg)
+
+	init, err := p.InitAuthorize(context.Background(), &pluginv1.InitAuthorizeRequest{
+		RedirectUri: testRedirect, State: "host-state-alice", LoginHint: "alice@example.com",
+	})
+	if err != nil {
+		t.Fatalf("InitAuthorize: %v", err)
+	}
+	authorizeQuery := mustQuery(t, init.GetAuthorizeUrl())
+	if authorizeQuery.Get("client_id") != idp.ClientID || !strings.HasPrefix(authorizeQuery.Get("request_uri"), "urn:ietf:params:oauth:request_uri:") {
+		t.Fatalf("PAR authorize query = %v", authorizeQuery)
+	}
+	for _, hidden := range []string{"nonce", "code_challenge", "code_challenge_method", "scope", "redirect_uri", "state", "prompt", "login_hint"} {
+		if authorizeQuery.Has(hidden) {
+			t.Errorf("PAR authorize URL leaked %q in browser query", hidden)
+		}
+	}
+
+	par := idp.LastPAR()
+	providerState := init.GetProviderState().GetFields()
+	verifier := providerState[stateCodeVerifier].GetStringValue()
+	if par.Form.Get("code_challenge_method") != "S256" || par.Form.Get("code_challenge") != oidc.S256Challenge(verifier) {
+		t.Errorf("PAR PKCE = %q/%q", par.Form.Get("code_challenge_method"), par.Form.Get("code_challenge"))
+	}
+	if par.Form.Get("nonce") == "" || par.Form.Get("nonce") != providerState[stateNonce].GetStringValue() {
+		t.Errorf("PAR nonce = %q", par.Form.Get("nonce"))
+	}
+	if par.Form.Get("prompt") != "select_account" || par.Form.Get("login_hint") != "alice@example.com" ||
+		par.Form.Get("state") != "host-state-alice" || par.Form.Get("redirect_uri") != testRedirect {
+		t.Errorf("PAR form = %v", par.Form)
+	}
+	if !strings.HasPrefix(par.Authorization, "Basic ") || par.Form.Get("client_secret") != "" {
+		t.Errorf("PAR default client auth should be client_secret_basic")
+	}
+
+	code, state, err := idp.Login(init.GetAuthorizeUrl(), "alice")
+	if err != nil {
+		t.Fatalf("login at IdP: %v", err)
+	}
+	account, err := p.ExchangeCode(context.Background(), &pluginv1.ExchangeCodeRequest{
+		Code: code, State: state, RedirectUri: testRedirect, ProviderState: init.GetProviderState(),
+	})
+	if err != nil {
+		t.Fatalf("ExchangeCode: %v", err)
+	}
+	requireAccount(t, account)
+
+	t.Run("client_secret_post works with PAR", func(t *testing.T) {
+		idp := newIdP(t, oidctest.WithPAR())
+		idp.Set(func(idp *oidctest.IdP) { idp.AuthMethod = "client_secret_post" })
+		cfg := baseSettings(idp)
+		cfg.connection["token_endpoint_auth_method"] = "client_secret_post"
+		p := newProvider(t, cfg)
+		requireAccount(t, signIn(t, p, idp, "alice").account)
+		if par := idp.LastPAR(); par.Form.Get("client_secret") != idp.ClientSecret || par.Authorization != "" {
+			t.Errorf("PAR did not use client_secret_post")
+		}
+	})
+
+	t.Run("disabled mode uses standard authorize URL", func(t *testing.T) {
+		idp := newIdP(t, oidctest.WithPAR())
+		cfg := baseSettings(idp)
+		cfg.connection["pushed_authorization_requests"] = PARDisabled
+		p := newProvider(t, cfg)
+		res := signIn(t, p, idp, "alice")
+		requireAccount(t, res.account)
+		if q := mustQuery(t, res.init.GetAuthorizeUrl()); q.Has("request_uri") || q.Get("code_challenge_method") != "S256" {
+			t.Errorf("disabled PAR query = %v", q)
+		}
+		if len(idp.PARRequests) != 0 {
+			t.Errorf("PAR endpoint called %d times while disabled", len(idp.PARRequests))
+		}
+	})
+}
+
+func TestPARFailures(t *testing.T) {
+	t.Run("required without endpoint", func(t *testing.T) {
+		idp := newIdP(t)
+		cfg := baseSettings(idp)
+		cfg.connection["pushed_authorization_requests"] = PARRequired
+		p := newProvider(t, cfg)
+		_, err := p.InitAuthorize(context.Background(), &pluginv1.InitAuthorizeRequest{RedirectUri: testRedirect, State: "s"})
+		if status.Code(err) != codes.FailedPrecondition {
+			t.Fatalf("err = %v, want FailedPrecondition", err)
+		}
+	})
+
+	t.Run("provider requires PAR without endpoint", func(t *testing.T) {
+		idp := newIdP(t)
+		idp.Set(func(idp *oidctest.IdP) { idp.RequirePAR = true })
+		p := newProvider(t, baseSettings(idp))
+		_, err := p.InitAuthorize(context.Background(), &pluginv1.InitAuthorizeRequest{RedirectUri: testRedirect, State: "s"})
+		if status.Code(err) != codes.FailedPrecondition {
+			t.Fatalf("err = %v, want FailedPrecondition", err)
+		}
+	})
+
+	t.Run("PAR 400 error returns FailedPrecondition without leaking secret", func(t *testing.T) {
+		idp := newIdP(t, oidctest.WithPAR())
+		idp.Set(func(idp *oidctest.IdP) { idp.PARStatus = 400 })
+		p := newProvider(t, baseSettings(idp))
+		_, err := p.InitAuthorize(context.Background(), &pluginv1.InitAuthorizeRequest{RedirectUri: testRedirect, State: "s"})
+		if status.Code(err) != codes.FailedPrecondition {
+			t.Fatalf("err = %v, want FailedPrecondition", err)
+		}
+		if strings.Contains(err.Error(), idp.ClientSecret) {
+			t.Errorf("error leaked client secret: %v", err)
+		}
+	})
+
+	t.Run("PAR 503 error returns Unavailable", func(t *testing.T) {
+		idp := newIdP(t, oidctest.WithPAR())
+		idp.Set(func(idp *oidctest.IdP) { idp.PARStatus = 503 })
+		p := newProvider(t, baseSettings(idp))
+		_, err := p.InitAuthorize(context.Background(), &pluginv1.InitAuthorizeRequest{RedirectUri: testRedirect, State: "s"})
+		if status.Code(err) != codes.Unavailable {
+			t.Fatalf("err = %v, want Unavailable", err)
+		}
+	})
+
+	t.Run("PAR response without request_uri returns FailedPrecondition", func(t *testing.T) {
+		idp := newIdP(t, oidctest.WithPAR())
+		idp.Set(func(idp *oidctest.IdP) { idp.OmitPARRequestURI = true })
+		p := newProvider(t, baseSettings(idp))
+		_, err := p.InitAuthorize(context.Background(), &pluginv1.InitAuthorizeRequest{RedirectUri: testRedirect, State: "s"})
+		if status.Code(err) != codes.FailedPrecondition {
+			t.Fatalf("err = %v, want FailedPrecondition", err)
+		}
+	})
+}
+
 func (p *Provider) clientForTest() (*oidc.Client, Config, error) {
 	cfg, client, err := p.current()
 	return client, cfg, err

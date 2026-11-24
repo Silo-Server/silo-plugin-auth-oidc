@@ -155,7 +155,7 @@ func (p *Provider) InitAuthorize(ctx context.Context, req *pluginv1.InitAuthoriz
 	if err != nil {
 		return nil, status.Error(codes.Internal, "generate nonce")
 	}
-	authorizeURL, err := client.AuthCodeURL(doc, oidc.AuthRequest{
+	authReq := oidc.AuthRequest{
 		RedirectURI:   req.GetRedirectUri(),
 		State:         req.GetState(),
 		Nonce:         nonce,
@@ -163,7 +163,16 @@ func (p *Provider) InitAuthorize(ctx context.Context, req *pluginv1.InitAuthoriz
 		Scopes:        cfg.RequestedScopes(),
 		Prompt:        prompt,
 		LoginHint:     req.GetLoginHint(),
-	})
+	}
+	var authorizeURL string
+	switch {
+	case cfg.PARMode == PARDisabled:
+		authorizeURL, err = client.AuthCodeURL(doc, authReq)
+	case cfg.PARMode == PARRequired || doc.RequirePushedAuthorizationRequests || doc.PushedAuthorizationRequestEndpoint != "":
+		authorizeURL, err = client.PushAuth(ctx, doc, authReq)
+	default:
+		authorizeURL, err = client.AuthCodeURL(doc, authReq)
+	}
 	if err != nil {
 		return nil, grpcError(err)
 	}
