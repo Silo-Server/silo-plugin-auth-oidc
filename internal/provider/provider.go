@@ -127,7 +127,11 @@ func (p *Provider) Authenticate(context.Context, *pluginv1.AuthenticateRequest) 
 }
 
 // InitAuthorize builds the authorization URL with PKCE S256 and a nonce, and
-// returns the verifier and nonce as provider_state for ExchangeCode.
+// returns the verifier and nonce as provider_state for ExchangeCode. When
+// pushed authorization requests are in use (see usePAR), it pushes the
+// parameters to the provider first, and the URL carries only client_id and
+// request_uri. A failed push fails the start; it is never retried as a
+// browser-URL request.
 func (p *Provider) InitAuthorize(ctx context.Context, req *pluginv1.InitAuthorizeRequest) (*pluginv1.InitAuthorizeResponse, error) {
 	if req.GetRedirectUri() == "" || req.GetState() == "" {
 		return nil, status.Error(codes.InvalidArgument, "redirect_uri and state are required")
@@ -155,7 +159,7 @@ func (p *Provider) InitAuthorize(ctx context.Context, req *pluginv1.InitAuthoriz
 	if err != nil {
 		return nil, status.Error(codes.Internal, "generate nonce")
 	}
-	authorizeURL, err := client.AuthCodeURL(doc, oidc.AuthRequest{
+	request := oidc.AuthRequest{
 		RedirectURI:   req.GetRedirectUri(),
 		State:         req.GetState(),
 		Nonce:         nonce,
@@ -163,9 +167,22 @@ func (p *Provider) InitAuthorize(ctx context.Context, req *pluginv1.InitAuthoriz
 		Scopes:        cfg.RequestedScopes(),
 		Prompt:        prompt,
 		LoginHint:     req.GetLoginHint(),
-	})
+	}
+	par, err := usePAR(cfg, doc)
 	if err != nil {
 		return nil, grpcError(err)
+	}
+	var authorizeURL string
+	if par {
+		authorizeURL, err = client.PushAuthorization(ctx, doc, request)
+		if err != nil {
+			return nil, parError(err)
+		}
+	} else {
+		authorizeURL, err = client.AuthCodeURL(doc, request)
+		if err != nil {
+			return nil, grpcError(err)
+		}
 	}
 	providerState, err := structpb.NewStruct(map[string]any{
 		stateCodeVerifier: verifier,
@@ -177,6 +194,40 @@ func (p *Provider) InitAuthorize(ctx context.Context, req *pluginv1.InitAuthoriz
 		return nil, status.Error(codes.Internal, "encode provider state")
 	}
 	return &pluginv1.InitAuthorizeResponse{AuthorizeUrl: authorizeURL, ProviderState: providerState}, nil
+}
+
+// usePAR decides whether a sign-in pushes its authorization request. It
+// depends only on the setting and whether discovery has a PAR endpoint;
+// require_pushed_authorization_requests is for the connection test alone.
+// Always without an endpoint is a settings error.
+func usePAR(cfg Config, doc *oidc.Discovery) (bool, error) {
+	advertised := doc.PushedAuthorizationRequestEndpoint != ""
+	switch cfg.PushedAuthorization {
+	case PARNever:
+		return false, nil
+	case PARAlways:
+		if !advertised {
+			return false, fmt.Errorf("%w: %s is set to Always, but the provider's discovery document has no pushed_authorization_request_endpoint",
+				oidc.ErrConfig, labelPAR)
+		}
+		return true, nil
+	default:
+		return advertised, nil
+	}
+}
+
+// parError maps a failed push to the InitAuthorize answer: Unavailable for a
+// provider that could not be reached or answered 5xx or 429, otherwise
+// FailedPrecondition naming the setting. The oidc errors carry the status and
+// a known error code but no text from the answer, which may echo request
+// values; the host logs this error.
+func parError(err error) error {
+	if errors.Is(err, oidc.ErrUnavailable) {
+		return status.Error(codes.Unavailable, err.Error())
+	}
+	return status.Error(codes.FailedPrecondition, fmt.Sprintf(
+		"%v; check %s and %s under Provider connection, or set %s to Never to sign in without them",
+		err, labelPAR, labelClientAuth, labelPAR))
 }
 
 // ExchangeCode redeems the code, validates the ID token, merges userinfo, and
@@ -323,7 +374,7 @@ func (p *Provider) CheckAccount(ctx context.Context, req *pluginv1.CheckAccountR
 	requested := time.Now()
 	token, err := client.Refresh(ctx, stored.refresh)
 	if err != nil {
-		var tokenErr *oidc.TokenError
+		var tokenErr *oidc.OAuthError
 		if !errors.As(err, &tokenErr) {
 			// The request may have reached the provider, which may have
 			// rotated the token and lost the answer. Keep the stored token,
@@ -413,7 +464,7 @@ func (p *Provider) CheckAccount(ctx context.Context, req *pluginv1.CheckAccountR
 // by the provider's hint, or else by the Refresh token lifetime setting.
 // Otherwise the account cannot be checked, and the host falls back to its
 // absolute session age instead of signing the person out.
-func (p *Provider) refreshRefused(cfg Config, stored refreshFields, tokenErr *oidc.TokenError) pluginv1.CheckAccountStatus {
+func (p *Provider) refreshRefused(cfg Config, stored refreshFields, tokenErr *oidc.OAuthError) pluginv1.CheckAccountStatus {
 	now := time.Now()
 	switch {
 	case stored.uncertain:
@@ -509,7 +560,7 @@ func (p *Provider) EndSessionUrl(ctx context.Context, req *pluginv1.AuthEndSessi
 // denyFor maps a protocol error to a denial and logs the detail.
 func (p *Provider) denyFor(stage string, err error) *pluginv1.AuthenticateResponse {
 	detail := stage + ": " + err.Error()
-	var tokenErr *oidc.TokenError
+	var tokenErr *oidc.OAuthError
 	switch {
 	case errors.As(err, &tokenErr) && tokenErr.Code == "invalid_grant":
 		return deny(pluginv1.AuthDenial_AUTH_DENIAL_INVALID_CREDENTIALS, detail)

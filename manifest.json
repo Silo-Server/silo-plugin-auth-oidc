@@ -8,7 +8,7 @@
     "display_name": "OpenID Connect Sign-in",
     "summary": "Sign in to Silo with an OpenID Connect provider such as Authelia, authentik, Pocket ID, Keycloak, Kanidm, Zitadel or Tinyauth.",
     "description_markdown": "Adds a \"Sign in with ...\" button that sends people to your OpenID Connect provider. The plugin validates the provider's ID token, reads the person's details and groups, and applies the allowed-groups and admin-groups rules. Silo creates or links the account and manages sessions.",
-    "setup_markdown": "1. At your provider, create a confidential client for Silo and register the redirect URI shown on Silo's Sign-in settings page.\n2. Enter the issuer URL, client ID and client secret under **Provider connection**, then run the connection test.\n3. Set the allowed and admin groups under **Access rules** if your provider sends groups.\n4. To let Silo re-check accounts at the provider, turn on **Request offline access** and make the provider's refresh-token lifetime longer than Silo's re-check interval plus about an hour. Unless the provider reports that lifetime, enter it as **Refresh token lifetime** so Silo can tell a revoked token from an expired one. Authelia never reports it. Keycloak reports it for offline tokens only when Offline Session Max Limited is on; otherwise enter the realm's Offline Session Idle (30d by default). If the provider also caps refresh tokens at a fixed age from sign-in, as Zitadel's Refresh Token Expiration does, enter that cap as **Refresh token absolute lifetime**.\n5. If you turn on **Sign out at the provider**, register Silo's sign-in page as a post-logout redirect URI at the provider.",
+    "setup_markdown": "1. At your provider, create a confidential client for Silo and register the redirect URI shown on Silo's Sign-in settings page.\n2. Enter the issuer URL, client ID and client secret under **Provider connection**, then run the connection test.\n3. Set the allowed and admin groups under **Access rules** if your provider sends groups.\n4. To let Silo re-check accounts at the provider, turn on **Request offline access** and make the provider's refresh-token lifetime longer than Silo's re-check interval plus about an hour. Unless the provider reports that lifetime, enter it as **Refresh token lifetime** so Silo can tell a revoked token from an expired one. Authelia never reports it. Keycloak reports it for offline tokens only when Offline Session Max Limited is on; otherwise enter the realm's Offline Session Idle (30d by default). If the provider also caps refresh tokens at a fixed age from sign-in, as Zitadel's Refresh Token Expiration does, enter that cap as **Refresh token absolute lifetime**.\n5. If you turn on **Sign out at the provider**, register Silo's sign-in page as a post-logout redirect URI at the provider.\n6. **Pushed authorization requests** sends the sign-in request over the back channel when the provider offers it: choose Always if the provider requires it for Silo's client, or Never if the connection test reports that the provider refuses Silo there.",
     "homepage_url": "https://github.com/Silo-Server/silo-plugin-auth-oidc",
     "source_url": "https://github.com/Silo-Server/silo-plugin-auth-oidc",
     "support_url": "https://github.com/Silo-Server/silo-plugin-auth-oidc/issues",
@@ -124,7 +124,7 @@
       "key": "connection",
       "title": "Provider connection",
       "description": "Where the OpenID Connect provider is and how Silo authenticates to it. The redirect URI to register at the provider is shown on the Sign-in settings page.",
-      "json_schema": "{\"type\":\"object\",\"properties\":{\"issuer_url\":{\"type\":\"string\"},\"client_id\":{\"type\":\"string\"},\"client_secret\":{\"type\":\"string\",\"writeOnly\":true},\"token_endpoint_auth_method\":{\"type\":\"string\",\"enum\":[\"client_secret_basic\",\"client_secret_post\"]},\"scopes\":{\"type\":\"string\"},\"request_groups_scope\":{\"type\":\"boolean\"},\"request_offline_access\":{\"type\":\"boolean\"},\"refresh_token_lifetime\":{\"type\":\"string\",\"maxLength\":16,\"pattern\":\"^\\\\s*(0|([0-9]{1,4})d|(?:([0-9]{1,6})h)?(?:([0-9]{1,7})m)?)\\\\s*$\"},\"refresh_token_max_lifetime\":{\"type\":\"string\",\"maxLength\":16,\"pattern\":\"^\\\\s*(0|([0-9]{1,4})d|(?:([0-9]{1,6})h)?(?:([0-9]{1,7})m)?)\\\\s*$\"},\"prompt\":{\"type\":\"string\",\"enum\":[\"\",\"login\",\"select_account\",\"consent\"]},\"provider_logout\":{\"type\":\"boolean\"},\"ca_pem\":{\"type\":\"string\"},\"allow_hs256\":{\"type\":\"boolean\"}},\"additionalProperties\":false}",
+      "json_schema": "{\"type\":\"object\",\"properties\":{\"issuer_url\":{\"type\":\"string\"},\"client_id\":{\"type\":\"string\"},\"client_secret\":{\"type\":\"string\",\"writeOnly\":true},\"token_endpoint_auth_method\":{\"type\":\"string\",\"enum\":[\"client_secret_basic\",\"client_secret_post\"]},\"pushed_authorization\":{\"type\":\"string\",\"enum\":[\"when_supported\",\"always\",\"never\"]},\"scopes\":{\"type\":\"string\"},\"request_groups_scope\":{\"type\":\"boolean\"},\"request_offline_access\":{\"type\":\"boolean\"},\"refresh_token_lifetime\":{\"type\":\"string\",\"maxLength\":16,\"pattern\":\"^\\\\s*(0|([0-9]{1,4})d|(?:([0-9]{1,6})h)?(?:([0-9]{1,7})m)?)\\\\s*$\"},\"refresh_token_max_lifetime\":{\"type\":\"string\",\"maxLength\":16,\"pattern\":\"^\\\\s*(0|([0-9]{1,4})d|(?:([0-9]{1,6})h)?(?:([0-9]{1,7})m)?)\\\\s*$\"},\"prompt\":{\"type\":\"string\",\"enum\":[\"\",\"login\",\"select_account\",\"consent\"]},\"provider_logout\":{\"type\":\"boolean\"},\"ca_pem\":{\"type\":\"string\"},\"allow_hs256\":{\"type\":\"boolean\"}},\"additionalProperties\":false}",
       "required": true,
       "admin_form": {
         "submit_label": "Save connection",
@@ -165,6 +165,27 @@
               {
                 "value": "client_secret_post",
                 "label": "Form body (client_secret_post)"
+              }
+            ]
+          },
+          {
+            "key": "pushed_authorization",
+            "label": "Pushed authorization requests",
+            "control": "ADMIN_FORM_CONTROL_SELECT",
+            "default_value": "when_supported",
+            "description": "Sends the sign-in request to the provider over the back channel (RFC 9126), authenticated as Silo, so the browser URL carries only a reference to it. Always fails sign-in when the provider does not offer it; choose it when the provider requires it for this client. Choose Never when the provider refuses Silo there, which the connection test reports.",
+            "options": [
+              {
+                "value": "when_supported",
+                "label": "When the provider supports it"
+              },
+              {
+                "value": "always",
+                "label": "Always"
+              },
+              {
+                "value": "never",
+                "label": "Never"
               }
             ]
           },
@@ -269,7 +290,8 @@
               "issuer_url",
               "client_id",
               "client_secret",
-              "token_endpoint_auth_method"
+              "token_endpoint_auth_method",
+              "pushed_authorization"
             ]
           },
           {

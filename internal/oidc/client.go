@@ -57,18 +57,59 @@ var ErrInvalidToken = errors.New("invalid token")
 // says the provider vouched for a different person, not that a check failed.
 var ErrSubjectMismatch = fmt.Errorf("%w: userinfo sub does not match the ID token sub", ErrInvalidToken)
 
-// TokenError is an OAuth 2.0 error response from the token endpoint.
-type TokenError struct {
+// Endpoint names used in errors.
+const (
+	EndpointToken = "token endpoint"
+	EndpointPAR   = "pushed authorization request endpoint"
+)
+
+// maxRequestURIBytes caps the request_uri a PAR endpoint may return, so the
+// authorization URL stays a usable length.
+const maxRequestURIBytes = 2048
+
+// OAuthError is an OAuth 2.0 error response from the token endpoint or the
+// pushed authorization request endpoint. Description is set only for the
+// token endpoint: a PAR endpoint may echo request values in it.
+type OAuthError struct {
+	Endpoint    string
 	Status      int
 	Code        string
 	Description string
 }
 
-func (e *TokenError) Error() string {
+func (e *OAuthError) Error() string {
 	if e.Description != "" {
-		return fmt.Sprintf("token endpoint answered %d %s: %s", e.Status, e.Code, e.Description)
+		return fmt.Sprintf("%s answered %d %s: %s", e.Endpoint, e.Status, e.Code, e.Description)
 	}
-	return fmt.Sprintf("token endpoint answered %d %s", e.Status, e.Code)
+	return fmt.Sprintf("%s answered %d %s", e.Endpoint, e.Status, e.Code)
+}
+
+// AnswerError is an answer from the pushed authorization request endpoint
+// that is neither a usable request_uri nor an OAuth error: a redirect, a
+// non-JSON 4xx, or a 2xx without a usable request_uri. It wraps ErrConfig.
+// Reason is fixed text; it never quotes the answer.
+type AnswerError struct {
+	Endpoint string
+	Status   int
+	Reason   string
+}
+
+func (e *AnswerError) Error() string {
+	return fmt.Sprintf("%s: %s answered %d %s", ErrConfig, e.Endpoint, e.Status, e.Reason)
+}
+
+func (e *AnswerError) Unwrap() error { return ErrConfig }
+
+// knownOAuthErrors are the error codes a PAR answer may carry, from RFC 6749,
+// RFC 9126, RFC 9101, and OpenID Connect Core. Any other value is reported as
+// unknown_error, so the plugin never repeats text the provider made up.
+var knownOAuthErrors = []string{
+	"invalid_request", "invalid_client", "invalid_grant", "unauthorized_client",
+	"unsupported_grant_type", "invalid_scope", "access_denied", "unsupported_response_type",
+	"server_error", "temporarily_unavailable", "invalid_request_uri", "invalid_request_object",
+	"request_not_supported", "request_uri_not_supported", "invalid_redirect_uri",
+	"interaction_required", "login_required", "account_selection_required", "consent_required",
+	"invalid_authorization_details", "invalid_dpop_proof", "use_dpop_nonce",
 }
 
 // Settings configure a Client. Issuer is compared byte for byte with the
@@ -86,16 +127,22 @@ type Settings struct {
 
 // Discovery is the subset of the OpenID Provider metadata the client uses.
 type Discovery struct {
-	Issuer                            string   `json:"issuer"`
-	AuthorizationEndpoint             string   `json:"authorization_endpoint"`
-	TokenEndpoint                     string   `json:"token_endpoint"`
-	UserinfoEndpoint                  string   `json:"userinfo_endpoint"`
-	JWKSURI                           string   `json:"jwks_uri"`
-	EndSessionEndpoint                string   `json:"end_session_endpoint"`
-	ScopesSupported                   []string `json:"scopes_supported"`
-	TokenEndpointAuthMethodsSupported []string `json:"token_endpoint_auth_methods_supported"`
-	IDTokenSigningAlgValuesSupported  []string `json:"id_token_signing_alg_values_supported"`
-	CodeChallengeMethodsSupported     []string `json:"code_challenge_methods_supported"`
+	Issuer                string `json:"issuer"`
+	AuthorizationEndpoint string `json:"authorization_endpoint"`
+	TokenEndpoint         string `json:"token_endpoint"`
+	UserinfoEndpoint      string `json:"userinfo_endpoint"`
+	JWKSURI               string `json:"jwks_uri"`
+	EndSessionEndpoint    string `json:"end_session_endpoint"`
+	// PushedAuthorizationRequestEndpoint and RequirePushedAuthorizationRequests
+	// are the RFC 9126 metadata. ValidateDiscovery does not check them, so a
+	// bad value cannot break sign-in without PAR, code exchange, re-checks, or
+	// provider logout. A value of the wrong type reads as absent.
+	PushedAuthorizationRequestEndpoint lenientString `json:"pushed_authorization_request_endpoint"`
+	RequirePushedAuthorizationRequests lenientBool   `json:"require_pushed_authorization_requests"`
+	ScopesSupported                    []string      `json:"scopes_supported"`
+	TokenEndpointAuthMethodsSupported  []string      `json:"token_endpoint_auth_methods_supported"`
+	IDTokenSigningAlgValuesSupported   []string      `json:"id_token_signing_alg_values_supported"`
+	CodeChallengeMethodsSupported      []string      `json:"code_challenge_methods_supported"`
 }
 
 // TokenResponse is a successful token endpoint answer.
@@ -144,6 +191,17 @@ func (s *lenientString) UnmarshalJSON(data []byte) error {
 	var value string
 	if json.Unmarshal(data, &value) == nil {
 		*s = lenientString(value)
+	}
+	return nil
+}
+
+// lenientBool decodes a JSON boolean and ignores any other type.
+type lenientBool bool
+
+func (b *lenientBool) UnmarshalJSON(data []byte) error {
+	var value bool
+	if json.Unmarshal(data, &value) == nil {
+		*b = lenientBool(value)
 	}
 	return nil
 }
@@ -370,27 +428,105 @@ type AuthRequest struct {
 	LoginHint     string
 }
 
-// AuthCodeURL builds the authorization URL. PKCE S256 and the nonce are always
-// sent, whatever discovery advertises.
+// values returns the authorization request parameters. The browser URL and
+// the pushed request both use it, so PKCE S256 and the nonce are always sent,
+// whatever discovery advertises.
+func (r AuthRequest) values(clientID string) url.Values {
+	values := url.Values{}
+	values.Set("response_type", "code")
+	values.Set("client_id", clientID)
+	values.Set("redirect_uri", r.RedirectURI)
+	values.Set("scope", strings.Join(r.Scopes, " "))
+	values.Set("state", r.State)
+	values.Set("nonce", r.Nonce)
+	values.Set("code_challenge", r.CodeChallenge)
+	values.Set("code_challenge_method", "S256")
+	if r.Prompt != "" {
+		values.Set("prompt", r.Prompt)
+	}
+	if r.LoginHint != "" {
+		values.Set("login_hint", r.LoginHint)
+	}
+	return values
+}
+
+// AuthCodeURL builds the authorization URL with every parameter in its query,
+// keeping any query the endpoint already has.
 func (c *Client) AuthCodeURL(doc *Discovery, request AuthRequest) (string, error) {
+	return authorizationURL(doc, request.values(c.settings.ClientID))
+}
+
+// PushAuthorization sends the authorization request to the provider's
+// pushed authorization request endpoint (RFC 9126), authenticated as the
+// client, and returns the authorization URL, which carries only client_id
+// and the returned request_uri. The push never follows a redirect: a 307 or
+// 308 would resend the form, and with client_secret_post the secret, to
+// another URL.
+//
+// Network errors, timeouts, 5xx and 429 answers wrap ErrUnavailable. A JSON
+// OAuth error is an *OAuthError without a description. Any other answer is
+// an *AnswerError. Neither repeats text from the answer.
+func (c *Client) PushAuthorization(ctx context.Context, doc *Discovery, request AuthRequest) (string, error) {
+	parEndpoint := string(doc.PushedAuthorizationRequestEndpoint)
+	if parEndpoint == "" {
+		return "", fmt.Errorf("%w: discovery has no pushed_authorization_request_endpoint", ErrConfig)
+	}
+	if err := requireHTTPS(parEndpoint, "pushed_authorization_request_endpoint"); err != nil {
+		return "", err
+	}
+	if _, err := url.Parse(doc.AuthorizationEndpoint); err != nil {
+		return "", fmt.Errorf("%w: authorization endpoint: %v", ErrConfig, err)
+	}
+	status, body, err := c.postForm(ctx, parEndpoint, EndpointPAR, request.values(c.settings.ClientID), false)
+	if err != nil {
+		return "", err
+	}
+	switch {
+	case status >= 500 || status == http.StatusTooManyRequests:
+		return "", fmt.Errorf("%w: %s answered %d", ErrUnavailable, EndpointPAR, status)
+	case status >= 300 && status < 400:
+		return "", &AnswerError{Endpoint: EndpointPAR, Status: status, Reason: "with a redirect, which Silo does not follow"}
+	case status != http.StatusOK && status != http.StatusCreated:
+		var oauthErr struct {
+			Error string `json:"error"`
+		}
+		if json.Unmarshal(body, &oauthErr) != nil || oauthErr.Error == "" {
+			return "", &AnswerError{Endpoint: EndpointPAR, Status: status, Reason: "with something other than a JSON OAuth error"}
+		}
+		code := oauthErr.Error
+		if !slices.Contains(knownOAuthErrors, code) {
+			code = "unknown_error"
+		}
+		return "", &OAuthError{Endpoint: EndpointPAR, Status: status, Code: code}
+	}
+	var answer struct {
+		RequestURI lenientString `json:"request_uri"`
+	}
+	if json.Unmarshal(body, &answer) != nil {
+		return "", &AnswerError{Endpoint: EndpointPAR, Status: status, Reason: "with a body that is not JSON"}
+	}
+	switch {
+	case answer.RequestURI == "":
+		return "", &AnswerError{Endpoint: EndpointPAR, Status: status, Reason: "with no request_uri"}
+	case len(answer.RequestURI) > maxRequestURIBytes:
+		return "", &AnswerError{Endpoint: EndpointPAR, Status: status,
+			Reason: fmt.Sprintf("with a request_uri longer than %d bytes", maxRequestURIBytes)}
+	}
+	values := url.Values{}
+	values.Set("client_id", c.settings.ClientID)
+	values.Set("request_uri", string(answer.RequestURI))
+	return authorizationURL(doc, values)
+}
+
+// authorizationURL adds values to the authorization endpoint's own query.
+func authorizationURL(doc *Discovery, values url.Values) (string, error) {
 	endpoint, err := url.Parse(doc.AuthorizationEndpoint)
 	if err != nil {
 		return "", fmt.Errorf("%w: authorization endpoint: %v", ErrConfig, err)
 	}
 	query := endpoint.Query()
-	query.Set("response_type", "code")
-	query.Set("client_id", c.settings.ClientID)
-	query.Set("redirect_uri", request.RedirectURI)
-	query.Set("scope", strings.Join(request.Scopes, " "))
-	query.Set("state", request.State)
-	query.Set("nonce", request.Nonce)
-	query.Set("code_challenge", request.CodeChallenge)
-	query.Set("code_challenge_method", "S256")
-	if request.Prompt != "" {
-		query.Set("prompt", request.Prompt)
-	}
-	if request.LoginHint != "" {
-		query.Set("login_hint", request.LoginHint)
+	for name, value := range values {
+		query[name] = value
 	}
 	endpoint.RawQuery = query.Encode()
 	return endpoint.String(), nil
@@ -441,7 +577,7 @@ func (c *Client) ProbeClientAuth(ctx context.Context, redirectURI string) (Probe
 	refresh.Set("grant_type", "refresh_token")
 	refresh.Set("refresh_token", "silo-connection-test-invalid-refresh-token")
 	_, err := c.token(ctx, refresh)
-	var tokenErr *TokenError
+	var tokenErr *OAuthError
 	switch {
 	case err == nil:
 		return ProbeAccepted, "", nil
@@ -477,6 +613,42 @@ func (c *Client) token(ctx context.Context, form url.Values) (*TokenResponse, er
 	if err != nil {
 		return nil, err
 	}
+	statusCode, body, err := c.postForm(ctx, doc.TokenEndpoint, EndpointToken, form, true)
+	if err != nil {
+		return nil, err
+	}
+	if statusCode >= 500 {
+		return nil, fmt.Errorf("%w: token endpoint answered %d", ErrUnavailable, statusCode)
+	}
+	if statusCode != http.StatusOK {
+		var oauthErr struct {
+			Error            string `json:"error"`
+			ErrorDescription string `json:"error_description"`
+		}
+		_ = json.Unmarshal(body, &oauthErr)
+		code := oauthErr.Error
+		if code == "" && statusCode == http.StatusUnauthorized {
+			code = "invalid_client"
+		}
+		if code == "" {
+			code = "unknown_error"
+		}
+		return nil, &OAuthError{Endpoint: EndpointToken, Status: statusCode, Code: code, Description: truncate(oauthErr.ErrorDescription, 200)}
+	}
+	var token TokenResponse
+	if err := json.Unmarshal(body, &token); err != nil {
+		return nil, fmt.Errorf("%w: token response is not JSON: %v", ErrConfig, err)
+	}
+	return &token, nil
+}
+
+// postForm authenticates as the client and posts form to endpoint, the same
+// way for the token and PAR endpoints: client_secret_basic, client_secret_post,
+// or client_id alone without a secret. It returns the status and the body;
+// only a failure to reach the endpoint or read the answer is an error, and it
+// wraps ErrUnavailable. Without followRedirects a redirect is returned as the
+// answer. name is the endpoint's name in errors.
+func (c *Client) postForm(ctx context.Context, endpoint, name string, form url.Values, followRedirects bool) (int, []byte, error) {
 	headers := http.Header{}
 	switch c.settings.TokenAuthMethod {
 	case AuthMethodPost:
@@ -493,45 +665,29 @@ func (c *Client) token(ctx context.Context, form url.Values) (*TokenResponse, er
 				url.QueryEscape(c.settings.ClientID), url.QueryEscape(c.settings.ClientSecret)))
 		}
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, doc.TokenEndpoint, strings.NewReader(form.Encode()))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
 	if err != nil {
-		return nil, fmt.Errorf("%w: token endpoint: %v", ErrConfig, err)
+		return 0, nil, fmt.Errorf("%w: %s: %v", ErrConfig, name, err)
 	}
 	req.Header = headers
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
-	resp, err := c.http.Do(req)
+	httpClient := c.http
+	if !followRedirects {
+		noRedirects := *c.http
+		noRedirects.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+		httpClient = &noRedirects
+	}
+	resp, err := httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("%w: token request: %v", ErrUnavailable, redactURLError(err))
+		return 0, nil, fmt.Errorf("%w: %s request: %v", ErrUnavailable, name, redactURLError(err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if err != nil {
-		return nil, fmt.Errorf("%w: token response: %v", ErrUnavailable, err)
+		return 0, nil, fmt.Errorf("%w: %s response: %v", ErrUnavailable, name, err)
 	}
-	if resp.StatusCode >= 500 {
-		return nil, fmt.Errorf("%w: token endpoint answered %d", ErrUnavailable, resp.StatusCode)
-	}
-	if resp.StatusCode != http.StatusOK {
-		var oauthErr struct {
-			Error            string `json:"error"`
-			ErrorDescription string `json:"error_description"`
-		}
-		_ = json.Unmarshal(body, &oauthErr)
-		code := oauthErr.Error
-		if code == "" && resp.StatusCode == http.StatusUnauthorized {
-			code = "invalid_client"
-		}
-		if code == "" {
-			code = "unknown_error"
-		}
-		return nil, &TokenError{Status: resp.StatusCode, Code: code, Description: truncate(oauthErr.ErrorDescription, 200)}
-	}
-	var token TokenResponse
-	if err := json.Unmarshal(body, &token); err != nil {
-		return nil, fmt.Errorf("%w: token response is not JSON: %v", ErrConfig, err)
-	}
-	return &token, nil
+	return resp.StatusCode, body, nil
 }
 
 // UserInfo fetches the userinfo claims with an access token. It accepts plain

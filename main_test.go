@@ -92,7 +92,8 @@ func TestManifestConfigSchema(t *testing.T) {
 	}
 	valid := map[string]any{
 		"issuer_url": "https://idp.example", "client_id": "silo", "client_secret": "s",
-		"token_endpoint_auth_method": "client_secret_basic", "scopes": "openid profile email",
+		"token_endpoint_auth_method": "client_secret_basic", "pushed_authorization": "when_supported",
+		"scopes":               "openid profile email",
 		"request_groups_scope": true, "request_offline_access": false, "prompt": "",
 		"provider_logout": false, "ca_pem": "", "allow_hs256": false, "refresh_token_lifetime": "30d",
 	}
@@ -126,6 +127,86 @@ func TestManifestConfigSchema(t *testing.T) {
 			}
 		}
 	}
+}
+
+// The pushed authorization setting offers exactly the plugin's modes, in the
+// admin form and the JSON schema, and defaults to when_supported. The host
+// rejects any other value on save.
+func TestManifestPushedAuthorization(t *testing.T) {
+	m := loadManifest(t)
+	var connection *pluginv1.ConfigSchema
+	for _, schema := range m.GetGlobalConfigSchema() {
+		if schema.GetKey() == "connection" {
+			connection = schema
+		}
+	}
+	var schema struct {
+		Properties map[string]struct {
+			Enum []string `json:"enum"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal([]byte(connection.GetJsonSchema()), &schema); err != nil {
+		t.Fatal(err)
+	}
+	if enum := schema.Properties["pushed_authorization"].Enum; !slices.Equal(enum, provider.PARModes) {
+		t.Errorf("json_schema enum = %v, want %v", enum, provider.PARModes)
+	}
+	var options []string
+	var defaultValue string
+	for _, field := range connection.GetAdminForm().GetFields() {
+		if field.GetKey() == "pushed_authorization" {
+			defaultValue = field.GetDefaultValue().GetStringValue()
+			for _, option := range field.GetOptions() {
+				options = append(options, option.GetValue())
+			}
+		}
+	}
+	if !slices.Equal(options, provider.PARModes) || defaultValue != provider.PARWhenSupported {
+		t.Errorf("admin form options = %v, default %q; want %v, default %q", options, defaultValue, provider.PARModes, provider.PARWhenSupported)
+	}
+	for _, value := range provider.PARModes {
+		edited := map[string]any{"issuer_url": "https://idp.example", "client_id": "silo", "pushed_authorization": value}
+		if err := publicconfig.ValidateManifestGlobalValue(m, "connection", edited); err != nil {
+			t.Errorf("pushed_authorization %q refused: %v", value, err)
+		}
+	}
+	edited := map[string]any{"issuer_url": "https://idp.example", "client_id": "silo", "pushed_authorization": "sometimes"}
+	if err := publicconfig.ValidateManifestGlobalValue(m, "connection", edited); err == nil {
+		t.Error("pushed_authorization accepted an unknown value")
+	}
+}
+
+// A connection field outside every form section renders above the Client
+// section, so each one must belong to exactly one section, and the PAR
+// setting sits right after the client authentication method.
+func TestManifestConnectionFieldsHaveSections(t *testing.T) {
+	m := loadManifest(t)
+	for _, schema := range m.GetGlobalConfigSchema() {
+		if schema.GetKey() != "connection" {
+			continue
+		}
+		form := schema.GetAdminForm()
+		placed := map[string]int{}
+		for _, section := range form.GetSections() {
+			for _, key := range section.GetFieldKeys() {
+				placed[key]++
+			}
+			if section.GetKey() == "client" {
+				keys := section.GetFieldKeys()
+				at := slices.Index(keys, "token_endpoint_auth_method")
+				if at < 0 || at+1 >= len(keys) || keys[at+1] != "pushed_authorization" {
+					t.Errorf("client section fields = %v, want pushed_authorization after token_endpoint_auth_method", keys)
+				}
+			}
+		}
+		for _, field := range form.GetFields() {
+			if placed[field.GetKey()] != 1 {
+				t.Errorf("connection field %q is in %d form sections, want 1", field.GetKey(), placed[field.GetKey()])
+			}
+		}
+		return
+	}
+	t.Fatal("no connection config key")
 }
 
 // Until the operator saves icon_url_path, the host shows the setting's

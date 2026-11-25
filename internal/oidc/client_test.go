@@ -114,3 +114,96 @@ func TestErrSubjectMismatchIsInvalidToken(t *testing.T) {
 		t.Fatal("ErrSubjectMismatch must wrap ErrInvalidToken so sign-in still refuses it")
 	}
 }
+
+// The PAR metadata is not part of discovery validation, so a bad value cannot
+// break sign-in without PAR, code exchange, re-checks, or provider logout.
+func TestValidateDiscoveryIgnoresPARMetadata(t *testing.T) {
+	doc := Discovery{
+		Issuer:                             "https://idp.example",
+		AuthorizationEndpoint:              "https://idp.example/authorize",
+		TokenEndpoint:                      "https://idp.example/token",
+		JWKSURI:                            "https://idp.example/jwks",
+		PushedAuthorizationRequestEndpoint: "http://idp.example/par",
+	}
+	if err := ValidateDiscovery(&doc, doc.Issuer); err != nil {
+		t.Fatalf("a non-https PAR endpoint failed discovery validation: %v", err)
+	}
+}
+
+func TestDiscoveryPARFieldsDecodeLeniently(t *testing.T) {
+	tests := []struct {
+		body         string
+		wantEndpoint string
+		wantRequired bool
+	}{
+		{`{"pushed_authorization_request_endpoint":"https://idp.example/par","require_pushed_authorization_requests":true}`, "https://idp.example/par", true},
+		{`{}`, "", false},
+		{`{"pushed_authorization_request_endpoint":42,"require_pushed_authorization_requests":"yes"}`, "", false},
+	}
+	for _, tt := range tests {
+		var doc Discovery
+		if err := json.Unmarshal([]byte(tt.body), &doc); err != nil {
+			t.Fatalf("%s: %v", tt.body, err)
+		}
+		if string(doc.PushedAuthorizationRequestEndpoint) != tt.wantEndpoint || bool(doc.RequirePushedAuthorizationRequests) != tt.wantRequired {
+			t.Errorf("%s: endpoint %q, required %v", tt.body, doc.PushedAuthorizationRequestEndpoint, doc.RequirePushedAuthorizationRequests)
+		}
+	}
+}
+
+// The browser URL and the pushed request share one parameter builder, so
+// PKCE S256 and the nonce go out on both paths, and no request_uri is ever
+// sent in a push.
+func TestAuthRequestValues(t *testing.T) {
+	request := AuthRequest{RedirectURI: "https://silo.example/cb", State: "s", Nonce: "n", CodeChallenge: "c", Scopes: []string{"openid", "email"}}
+	values := request.values("client")
+	for name, want := range map[string]string{
+		"response_type": "code", "client_id": "client", "redirect_uri": "https://silo.example/cb", "scope": "openid email",
+		"state": "s", "nonce": "n", "code_challenge": "c", "code_challenge_method": "S256",
+	} {
+		if got := values.Get(name); got != want {
+			t.Errorf("%s = %q, want %q", name, got, want)
+		}
+	}
+	for _, absent := range []string{"prompt", "login_hint", "request_uri"} {
+		if values.Has(absent) {
+			t.Errorf("%s sent without being set", absent)
+		}
+	}
+	client, err := NewClient(Settings{Issuer: "https://idp.example", ClientID: "client"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc := &Discovery{AuthorizationEndpoint: "https://idp.example/authorize?tenant=t"}
+	authURL, err := client.AuthCodeURL(doc, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(authURL, "tenant=t") || !strings.Contains(authURL, "code_challenge_method=S256") {
+		t.Errorf("AuthCodeURL = %q", authURL)
+	}
+}
+
+func TestOAuthErrorNamesItsEndpoint(t *testing.T) {
+	err := &OAuthError{Endpoint: EndpointPAR, Status: 400, Code: "invalid_request"}
+	if got := err.Error(); got != "pushed authorization request endpoint answered 400 invalid_request" {
+		t.Errorf("Error() = %q", got)
+	}
+	answer := &AnswerError{Endpoint: EndpointPAR, Status: 307, Reason: "with a redirect, which Silo does not follow"}
+	if !errors.Is(answer, ErrConfig) {
+		t.Error("AnswerError must wrap ErrConfig")
+	}
+}
+
+func TestPushAuthorizationRequiresHTTPSEndpoint(t *testing.T) {
+	client, err := NewClient(Settings{Issuer: "https://idp.example", ClientID: "client"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, endpoint := range []string{"", "http://idp.example/par", "/par"} {
+		doc := &Discovery{AuthorizationEndpoint: "https://idp.example/authorize", PushedAuthorizationRequestEndpoint: lenientString(endpoint)}
+		if _, err := client.PushAuthorization(t.Context(), doc, AuthRequest{}); !errors.Is(err, ErrConfig) {
+			t.Errorf("endpoint %q: err = %v, want ErrConfig before any request", endpoint, err)
+		}
+	}
+}
